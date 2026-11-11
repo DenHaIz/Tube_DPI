@@ -9,7 +9,7 @@ YouTube / ReVanced / Morphe ─► TUN (VpnService, только выбранн�
 
 - **Только выбранные приложения** идут через туннель (`addAllowedApplication`), остальные — напрямую.
 - **Автозапуск с YouTube**: служба спецвозможностей видит только имя приложения на экране; включает обход при открытии клиента и выключает через N минут после ухода (не выключает, пока идёт фоновое воспроизведение).
-- **Автоподбор стратегии**: ~80 вариантов (свой список + набор ByeByeDPI), каждый — в отдельном процессе byedpi на своём порту; проверяются `www.youtube.com` (> 64 КБ, видно замедление), `i.ytimg.com` и `*.googlevideo.com`, плюс те же узлы без обхода.
+- **Автоподбор стратегии**: ~80 вариантов (свой список + набор ByeByeDPI), каждый — в отдельном процессе byedpi на своём порту; проверяются `www.youtube.com` (> 64 КБ, видно замедление), `i.ytimg.com` и настоящий видеоузел сети `rrN---sn-….googlevideo.com` — и полным TLS, и ClientHello как у Chrome/YouTube (Kyber, ~1.8 КБ). Результаты хранятся по сетям, сторож меняет сломавшуюся стратегию.
 - **DNS через DoH**: с февраля 2026 youtube.com не резолвится через национальный DNS. Туннель отвечает приложениям сам (mapdns), а byedpi резолвит имена через DNS-сервер Tube на 127.0.0.1, который ходит в DoH Google/Cloudflare по IP (`getaddrinfo` подменён при линковке, см. `core-byedpi/src/main/cpp/tube_dns.c`).
 - **Техники Flowseal zapret-discord-youtube** перенесены в пределах byedpi без root: фейковые ClientHello google.com / vk.com / gosuslugi.ru и QUIC Initial из zapret (`assets/fake`), multisplit, hostfakesplit-аналог, фейковый SNI на выбор. Не переносятся без root: seqovl, badseq, ts-fooling, autottl.
 - **QUIC** по умолчанию запрещён (`byedpi -U`) — YouTube уходит на TCP.
@@ -37,6 +37,8 @@ git submodule update --init --recursive
 .\gradlew.bat :app:testDebugUnitTest -Pscreenshots   # скриншоты → app\build\outputs\roborazzi
 .\gradlew.bat :app:lintDebug :app:assembleRelease
 ```
+
+Подробности для продолжения работы — в [HANDOFF.md](HANDOFF.md).
 
 Release подписан debug-ключом общего тулчейна (`.toolchain/android-user-home/debug.keystore`) — не терять, иначе обновление не встанет поверх.
 

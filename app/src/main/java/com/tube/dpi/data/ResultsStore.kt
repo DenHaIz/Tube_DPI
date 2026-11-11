@@ -2,6 +2,7 @@ package com.tube.dpi.data
 
 import android.content.Context
 import com.tube.byedpi.Probe
+import com.tube.byedpi.ProbeKind
 import com.tube.byedpi.ProbeResult
 import com.tube.byedpi.Strategies
 import com.tube.byedpi.Strategy
@@ -22,6 +23,8 @@ data class NetworkResults(
     val scores: Map<String, StrategyScore> = emptyMap(),
     /** Стратегия, выбранная для этой сети (вручную или сторожем). */
     val chosen: String? = null,
+    /** Настоящий видеоузел сети (rrN---sn-….googlevideo.com), найденный при подборе. */
+    val videoHost: String? = null,
 ) {
     val ranking: List<StrategyScore> get() = StrategyTester.rank(scores.values.toList())
     val working: List<StrategyScore> get() = ranking.filter { it.works }
@@ -55,14 +58,22 @@ class ResultsStore(context: Context) {
     }.getOrDefault(emptyMap())
 
     companion object {
+        /**
+         * Версия методики проверки. Результаты старой методики сбрасываются (выбор стратегии остаётся):
+         * в 0.2 не было проверки ClientHello «как у Chrome», и часть стратегий помечалась рабочими зря.
+         */
+        const val PROBE_VERSION = 2
+
         internal fun encode(all: Map<String, NetworkResults>): JSONObject = JSONObject().apply {
             all.forEach { (key, value) -> put(key, encodeNetwork(value)) }
         }
 
         private fun encodeNetwork(n: NetworkResults) = JSONObject().apply {
+            put("probeVersion", PROBE_VERSION)
             put("testedAt", n.testedAt)
             n.systemDns?.let { put("systemDns", it) }
             n.chosen?.let { put("chosen", it) }
+            n.videoHost?.let { put("videoHost", it) }
             n.baseline?.let { put("baseline", encodeScore(it)) }
             put("scores", JSONArray().apply { n.scores.values.forEach { put(encodeScore(it)) } })
         }
@@ -78,6 +89,7 @@ class ResultsStore(context: Context) {
                         put("host", r.probe.host)
                         put("path", r.probe.path)
                         put("min", r.probe.minBytes)
+                        put("kind", r.probe.kind.name)
                         put("ok", r.ok)
                         put("ms", r.millis)
                         put("bytes", r.bytes)
@@ -89,12 +101,16 @@ class ResultsStore(context: Context) {
 
         internal fun decodeNetwork(o: JSONObject): NetworkResults {
             val scores = o.optJSONArray("scores")?.let { arr -> (0 until arr.length()).map { decodeScore(arr.getJSONObject(it)) } }.orEmpty()
+            if (o.optInt("probeVersion") < PROBE_VERSION) {
+                return NetworkResults(chosen = o.optString("chosen").ifEmpty { null })
+            }
             return NetworkResults(
                 testedAt = o.optLong("testedAt"),
                 systemDns = if (o.has("systemDns")) o.getBoolean("systemDns") else null,
                 baseline = o.optJSONObject("baseline")?.let(::decodeScore),
                 scores = scores.associateBy { it.strategy.id },
                 chosen = o.optString("chosen").ifEmpty { null },
+                videoHost = o.optString("videoHost").ifEmpty { null },
             )
         }
 
@@ -106,7 +122,10 @@ class ResultsStore(context: Context) {
                 (0 until arr.length()).map { i ->
                     val r = arr.getJSONObject(i)
                     ProbeResult(
-                        Probe(r.getString("host"), r.optString("path", "/"), r.optInt("min")),
+                        Probe(
+                            r.getString("host"), r.optString("path", "/"), r.optInt("min"),
+                            kind = runCatching { ProbeKind.valueOf(r.optString("kind")) }.getOrDefault(ProbeKind.Https),
+                        ),
                         r.getBoolean("ok"), r.optLong("ms"), r.optInt("bytes"), r.optString("error").ifEmpty { null },
                     )
                 }

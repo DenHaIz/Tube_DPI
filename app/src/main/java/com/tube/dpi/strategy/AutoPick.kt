@@ -66,16 +66,22 @@ class AutoPick(
         val custom = settings.customArgs.first().takeIf { it.isNotBlank() }
         val candidates = Strategies.all + listOfNotNull(custom?.let { Strategy(Strategies.CUSTOM_ID, "CUSTOM", it, "Своя стратегия", "Custom strategy") })
         val tester = tester()
-        val probes = StrategyTester.defaultProbes()
+        val blockUdp = settings.blockQuic.first()
         _progress.value = TestProgress(running = true, total = candidates.size, background = background)
         try {
             val systemDns = withContext(Dispatchers.IO) { tester.systemDnsResolves() }
+            // Настоящий видеоузел сети: страница просмотра читается через текущую и ранее рабочие стратегии.
+            val saved = results.of(key)
+            val current = settings.strategy.first()
+            val discoveryOrder = (listOf(current) + saved?.working?.map { it.strategy }.orEmpty() + Strategies.builtIn).distinctBy { it.id }
+            val videoHost = tester.discoverVideoHost(discoveryOrder, blockUdp) ?: saved?.videoHost
+            val probes = StrategyTester.defaultProbes(videoHost)
             val baseline = tester.baseline(probes)
             // Новый подбор заменяет старые результаты этой сети, выбор стратегии сохраняется.
-            results.update(key) { it.copy(testedAt = System.currentTimeMillis(), systemDns = systemDns, baseline = baseline, scores = emptyMap()) }
-            log.value = listOf("network: $key", "system DNS resolves www.youtube.com: $systemDns", describe(baseline))
+            results.update(key) { it.copy(testedAt = System.currentTimeMillis(), systemDns = systemDns, baseline = baseline, scores = emptyMap(), videoHost = videoHost) }
+            log.value = listOf("network: $key", "system DNS resolves www.youtube.com: $systemDns", "video host: ${videoHost ?: "not found"}", describe(baseline))
             var ranking = emptyList<StrategyScore>()
-            tester.run(candidates, probes, settings.blockQuic.first()).collect { event ->
+            tester.run(candidates, probes, blockUdp).collect { event ->
                 when (event) {
                     is TestEvent.Progress -> {
                         results.update(key) { it.copy(scores = it.scores + (event.score.strategy.id to event.score)) }
@@ -93,7 +99,8 @@ class AutoPick(
 
     /** Проверка одной стратегии на свободном порту; результат тоже сохраняется. */
     suspend fun testOne(strategy: Strategy): StrategyScore {
-        val score = tester().testOne(strategy, SINGLE_PORT, StrategyTester.defaultProbes(), settings.blockQuic.first())
+        val videoHost = results.of(network.current.value?.key)?.videoHost
+        val score = tester().testOne(strategy, SINGLE_PORT, StrategyTester.defaultProbes(videoHost), settings.blockQuic.first())
         network.current.value?.key?.let { key -> results.update(key) { it.copy(scores = it.scores + (strategy.id to score)) } }
         return score
     }
@@ -111,7 +118,8 @@ class AutoPick(
                 return@buildString
             }
             score.results.joinTo(this, "; ") { r ->
-                r.probe.host + " " + if (r.ok) "ok ${r.millis}ms" else "FAIL ${r.bytes}B ${r.error.orEmpty()}"
+                val kind = if (r.probe.kind == com.tube.byedpi.ProbeKind.ChromeHello) " [chrome]" else ""
+                r.probe.host + kind + " " + if (r.ok) "ok ${r.millis}ms" else "FAIL ${r.bytes}B ${r.error.orEmpty()}"
             }
         }
     }

@@ -64,13 +64,16 @@ fun SettingsCard(
     }
 }
 
-/** Строка с переключателем: капля-бегунок перетекает пружиной. */
+/**
+ * Переключатель по центру: название, необязательная короткая подпись и капля-бегунок под ними.
+ * Вертикальная раскладка не упирается в края даже на узких экранах.
+ */
 @Composable
-fun ToggleRow(title: String, status: String, checked: Boolean, enabled: Boolean = true, onChange: (Boolean) -> Unit) {
+fun ToggleRow(title: String, status: String? = null, checked: Boolean, enabled: Boolean = true, onChange: (Boolean) -> Unit) {
     val colors = TubeTheme.colors
     val track by animateColorAsState(if (checked) colors.success else colors.chip, Motion.snappy(), label = "track")
     val knob by animateFloatAsState(if (checked) 1f else 0f, Motion.bouncy(), label = "knob")
-    Row(
+    Column(
         Modifier
             .fillMaxWidth()
             .graphicsLayer { alpha = if (enabled) 1f else 0.5f }
@@ -79,17 +82,15 @@ fun ToggleRow(title: String, status: String, checked: Boolean, enabled: Boolean 
                 role = Role.Switch
                 toggleableState = ToggleableState(checked)
             },
-        verticalAlignment = Alignment.CenterVertically,
+        horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        StatusDot(if (checked) colors.success else colors.textTertiary)
-        Spacer(Modifier.size(12.dp))
-        Column(Modifier.weight(1f)) {
-            FitText(title, style = MaterialTheme.typography.titleMedium, color = colors.textPrimary)
-            Text(status, style = MaterialTheme.typography.bodyMedium, color = colors.textSecondary, maxLines = 3)
+        Text(title, style = MaterialTheme.typography.titleMedium, color = colors.textPrimary, textAlign = TextAlign.Center)
+        if (status != null) {
+            Text(status, style = MaterialTheme.typography.bodyMedium, color = colors.textSecondary, textAlign = TextAlign.Center)
         }
+        Spacer(Modifier.size(8.dp))
         Box(
             Modifier
-                .padding(start = 12.dp)
                 .size(width = 52.dp, height = 32.dp)
                 .clip(Shapes.Pill)
                 .background(track)
@@ -109,7 +110,7 @@ fun ToggleRow(title: String, status: String, checked: Boolean, enabled: Boolean 
     }
 }
 
-/** Строка состояния разрешения: точка-индикатор и кнопка действия, пока не выполнено. */
+/** Состояние разрешения по центру: название с точкой-индикатором, подпись и кнопка, пока не выполнено. */
 @Composable
 fun PermissionRow(
     title: String,
@@ -120,21 +121,22 @@ fun PermissionRow(
     optional: Boolean = false,
 ) {
     val colors = TubeTheme.colors
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        StatusDot(
-            when {
-                ok -> colors.success
-                optional -> colors.textTertiary
-                else -> colors.warning
-            },
-        )
-        Spacer(Modifier.size(12.dp))
-        Column(Modifier.weight(1f)) {
-            FitText(title, style = MaterialTheme.typography.titleMedium, color = colors.textPrimary)
-            Text(status, style = MaterialTheme.typography.bodyMedium, color = colors.textSecondary, maxLines = 3)
+    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            StatusDot(
+                when {
+                    ok -> colors.success
+                    optional -> colors.textTertiary
+                    else -> colors.warning
+                },
+            )
+            Spacer(Modifier.size(8.dp))
+            Text(title, style = MaterialTheme.typography.titleMedium, color = colors.textPrimary, textAlign = TextAlign.Center)
         }
+        Text(status, style = MaterialTheme.typography.bodyMedium, color = colors.textSecondary, textAlign = TextAlign.Center)
         if (!ok) {
-            PillButton(action, onClick = onAction, modifier = Modifier.padding(start = 8.dp), compact = true)
+            Spacer(Modifier.size(8.dp))
+            PillButton(action, onClick = onAction, compact = true)
         }
     }
 }

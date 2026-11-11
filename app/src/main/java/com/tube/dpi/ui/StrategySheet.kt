@@ -38,6 +38,8 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.tube.byedpi.ProbeGroup
+import com.tube.byedpi.ProbeKind
 import com.tube.byedpi.Strategies
 import com.tube.byedpi.Strategy
 import com.tube.byedpi.StrategyScore
@@ -311,8 +313,9 @@ private fun StrategyRow(strategy: Strategy, args: RowArgs) {
                     textAlign = TextAlign.Center,
                 )
                 score?.results?.filter { !it.ok }?.forEach { r ->
+                    val kind = if (r.probe.kind == ProbeKind.ChromeHello) " (Chrome)" else ""
                     Text(
-                        "${r.probe.host}: ${r.error ?: "${r.bytes} B"}",
+                        "${r.probe.host}$kind: ${r.error ?: "${r.bytes} B"}",
                         style = MaterialTheme.typography.labelMedium,
                         color = colors.danger.copy(alpha = 0.85f),
                         textAlign = TextAlign.Center,
@@ -348,15 +351,17 @@ fun ProbeChips(score: StrategyScore, modifier: Modifier = Modifier) {
         horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterHorizontally),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        score.results.forEach { result ->
-            val label = when {
-                "googlevideo" in result.probe.host -> lang.pick("видео", "video")
-                "ytimg" in result.probe.host -> lang.pick("превью", "thumbs")
-                else -> lang.pick("сайт", "site")
+        // Узел считается доступным, только если прошли обе проверки: полный TLS и ClientHello как у YouTube.
+        score.results.groupBy { it.probe.group }.toSortedMap().forEach { (group, list) ->
+            val ok = list.all { it.ok }
+            val label = when (group) {
+                ProbeGroup.Video -> lang.pick("видео", "video")
+                ProbeGroup.Thumbs -> lang.pick("превью", "thumbs")
+                ProbeGroup.Site -> lang.pick("сайт", "site")
             }
-            val color = if (result.ok) colors.success else colors.danger
+            val color = if (ok) colors.success else colors.danger
             Text(
-                (if (result.ok) "✓ " else "✕ ") + label,
+                (if (ok) "✓ " else "✕ ") + label,
                 style = MaterialTheme.typography.labelLarge,
                 color = color,
                 maxLines = 1,

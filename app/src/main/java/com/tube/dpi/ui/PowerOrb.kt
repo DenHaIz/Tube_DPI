@@ -25,6 +25,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.tube.ui.components.bouncyClickable
 import com.tube.ui.glass.liquidGlass
@@ -40,7 +41,7 @@ enum class OrbState { Off, Starting, On, Failed }
  * запуск — бегущая дуга (единственная бесконечная анимация, только пока идёт запуск).
  */
 @Composable
-fun PowerOrb(state: OrbState, label: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
+fun PowerOrb(state: OrbState, label: String, onClick: () -> Unit, modifier: Modifier = Modifier, diameter: Dp = 236.dp) {
     val colors = TubeTheme.colors
     val on = state == OrbState.On
     val glow by animateFloatAsState(if (on) 1f else 0f, Motion.soft(), label = "glow")
@@ -68,7 +69,7 @@ fun PowerOrb(state: OrbState, label: String, onClick: () -> Unit, modifier: Modi
     val track = colors.chip
     Box(
         modifier
-            .size(236.dp)
+            .size(diameter)
             .drawBehind {
                 if (glow > 0.01f) {
                     drawCircle(
@@ -84,14 +85,14 @@ fun PowerOrb(state: OrbState, label: String, onClick: () -> Unit, modifier: Modi
     ) {
         Box(
             Modifier
-                .size(184.dp)
+                .size(diameter * 0.78f)
                 .semantics { contentDescription = label }
                 .bouncyClickable(pressedScale = 0.93f, glowColor = accent, glowShape = Shapes.Pill, onClick = onClick)
                 .liquidGlass(Shapes.Pill)
                 .drawWithContent {
                     drawContent()
-                    val stroke = 7.dp.toPx()
-                    val inset = 14.dp.toPx()
+                    val stroke = (diameter * 0.03f).toPx()
+                    val inset = (diameter * 0.06f).toPx()
                     val arcSize = Size(size.width - inset * 2, size.height - inset * 2)
                     val topLeft = Offset(inset, inset)
                     drawArc(track, 0f, 360f, false, topLeft, arcSize, style = Stroke(stroke))
@@ -107,7 +108,7 @@ fun PowerOrb(state: OrbState, label: String, onClick: () -> Unit, modifier: Modi
                 contentDescription = null,
                 tint = tint,
                 modifier = Modifier
-                    .size(68.dp)
+                    .size(diameter * 0.29f)
                     .graphicsLayer {
                         val s = 1f + 0.06f * glow
                         scaleX = s

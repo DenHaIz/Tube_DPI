@@ -59,7 +59,7 @@ class StrategyWatchdog(
                 }
             }
 
-            val ok = checkCurrent()
+            val ok = checkCurrent(container.results.of(key)?.videoHost)
             TunnelState.setWatchdog(WatchdogStatus(System.currentTimeMillis(), ok))
             if (ok) {
                 failures = 0
@@ -79,9 +79,9 @@ class StrategyWatchdog(
         }
     }
 
-    private suspend fun checkCurrent(): Boolean {
+    private suspend fun checkCurrent(videoHost: String?): Boolean {
         val tester = StrategyTester(context)
-        return tester.checkThrough(proxyPort, StrategyTester.defaultProbes()).all { it.ok }
+        return tester.checkThrough(proxyPort, StrategyTester.defaultProbes(videoHost)).all { it.ok }
     }
 
     /** Есть ли интернет вообще: без него менять стратегию бессмысленно. */

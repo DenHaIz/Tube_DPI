@@ -11,14 +11,42 @@ import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
 import java.net.Socket
 import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 import kotlin.coroutines.coroutineContext
 
-/** Что проверяем: TLS до узла и, если [minBytes] > 0, что ответ не «замирает» после первых килобайт. */
-data class Probe(val host: String, val path: String, val minBytes: Int)
+/** Как проверяем узел. */
+enum class ProbeKind {
+    /** Полный TLS (Java) и HTTP GET: видно замедление, при котором поток замирает после ~16 КБ. */
+    Https,
+
+    /** ClientHello как у Chrome/YouTube (~1.8 КБ, Kyber): прошёл ли он DPI и ответил ли сервер. */
+    ChromeHello,
+}
+
+/** Что проверяем: узел, путь, сколько байт должно прийти; [group] — для экрана (сайт, превью, видео). */
+data class Probe(
+    val host: String,
+    val path: String,
+    val minBytes: Int,
+    val kind: ProbeKind = ProbeKind.Https,
+    val group: ProbeGroup = ProbeGroup.of(host),
+)
+
+enum class ProbeGroup {
+    Site, Thumbs, Video;
+
+    companion object {
+        fun of(host: String): ProbeGroup = when {
+            "googlevideo" in host -> Video
+            "ytimg" in host -> Thumbs
+            else -> Site
+        }
+    }
+}
 
 data class ProbeResult(val probe: Probe, val ok: Boolean, val millis: Long, val bytes: Int, val error: String?)
 
@@ -98,12 +126,19 @@ class StrategyTester(
         probes.map { probe -> async(Dispatchers.IO) { probe(port, probe) } }.awaitAll()
     }
 
+    private val chromeTemplate: ByteArray by lazy {
+        context.assets.open(CHROME_TEMPLATE).use { it.readBytes() }
+    }
+
     private suspend fun probe(port: Int?, probe: Probe): ProbeResult {
         coroutineContext.ensureActive()
         val started = System.nanoTime()
         val target = maxOf(probe.minBytes, 1)
         return try {
-            val bytes = httpsGet(port, probe.host, probe.path, target, timeoutMs).size
+            val bytes = when (probe.kind) {
+                ProbeKind.Https -> httpsGet(port, probe.host, probe.path, target, timeoutMs).size
+                ProbeKind.ChromeHello -> chromeHandshake(port, probe.host, ChromeHello.build(chromeTemplate, probe.host), target, timeoutMs)
+            }
             val ok = bytes >= target
             ProbeResult(probe, ok, (System.nanoTime() - started) / 1_000_000, bytes, if (ok) null else "short read $bytes")
         } catch (e: Exception) {
@@ -112,14 +147,32 @@ class StrategyTester(
     }
 
     /**
-     * Те же проверки без прокси: видно, блокирует ли сеть YouTube вообще
-     * (приложение не входит в собственный VPN, поэтому соединения идут напрямую).
+     * Настоящий видеоузел этой сети (rrN---sn-….googlevideo.com) — именно с него YouTube качает видео.
+     * Ссылка есть на странице просмотра; страница читается через первую сработавшую стратегию из [candidates].
      */
+    suspend fun discoverVideoHost(candidates: List<Strategy>, blockUdp: Boolean): String? = withContext(Dispatchers.IO) {
+        for (strategy in candidates.take(DISCOVERY_ATTEMPTS)) {
+            ensureActive()
+            val argv = (StrategyArgs.parse(strategy.args) as? StrategyArgs.Result.Ok)?.argv ?: continue
+            val proxy = runCatching { ByeDpiProcess.start(context, DISCOVERY_PORT, argv, blockUdp, fakeSni) }.getOrNull() ?: continue
+            try {
+                runCatching { findVideoHost(DISCOVERY_PORT, timeoutMs * 2) }.getOrNull()?.let { return@withContext it }
+            } finally {
+                proxy.stop()
+            }
+        }
+        null
+    }
+
     /** Отдаёт ли DNS провайдера адрес youtube.com (с февраля 2026 многие — нет; byedpi тогда ходит через DoH). */
     fun systemDnsResolves(host: String = "www.youtube.com"): Boolean = runCatching {
         java.net.InetAddress.getAllByName(host).any { !it.isAnyLocalAddress && !it.isLoopbackAddress }
     }.getOrDefault(false)
 
+    /**
+     * Те же проверки без прокси: видно, блокирует ли сеть YouTube вообще
+     * (приложение не входит в собственный VPN, поэтому соединения идут напрямую).
+     */
     suspend fun baseline(probes: List<Probe>): StrategyScore = coroutineScope {
         val results = probes.map { probe -> async(Dispatchers.IO) { probe(null, probe) } }.awaitAll()
         StrategyScore(Strategy(BASELINE_ID, "DIRECT", "", "Без обхода", "No bypass"), results)
@@ -128,16 +181,99 @@ class StrategyTester(
     companion object {
         const val BASELINE_ID = "direct"
 
+        private const val CHROME_TEMPLATE = "fake/tls_clienthello_vk_com_kyber.bin"
+        private const val DISCOVERY_PORT = 11090
+        private const val DISCOVERY_ATTEMPTS = 8
+        private const val FALLBACK_VIDEO_HOST = "redirector.googlevideo.com"
+
+        /** Ответ сервера на ClientHello: ServerHello + сертификаты — несколько КБ. Меньше — DPI оборвал. */
+        private const val CHROME_MIN_BYTES = 2000
+
         /**
-         * Узлы, которые нужны приложению YouTube: страница, превью и видеосервер.
-         * redirector отвечает с SNI *.googlevideo.com — по нему ТСПУ и режет видео.
-         * Страница качается целиком (> 64 КБ): так видно замедление, при котором поток «замирает» после ~16 КБ.
+         * Проверки «как у приложения YouTube»: страница, превью и видеоузел, каждый — и полным TLS
+         * с загрузкой (замедление), и ClientHello как у Chrome (именно его видит DPI в приложении).
+         * [videoHost] — настоящий узел сети; без него — redirector (тот же SNI *.googlevideo.com).
          */
-        fun defaultProbes(): List<Probe> = listOf(
-            Probe("www.youtube.com", "/", minBytes = 64 * 1024),
-            Probe("i.ytimg.com", "/vi/jNQXAC9IVRw/hqdefault.jpg", minBytes = 8 * 1024),
-            Probe("redirector.googlevideo.com", "/report_mapping?di=no", minBytes = 16),
-        )
+        fun defaultProbes(videoHost: String? = null): List<Probe> {
+            val video = videoHost ?: FALLBACK_VIDEO_HOST
+            return listOf(
+                Probe("www.youtube.com", "/", minBytes = 64 * 1024),
+                Probe("www.youtube.com", "", minBytes = CHROME_MIN_BYTES, kind = ProbeKind.ChromeHello),
+                Probe("i.ytimg.com", "/vi/jNQXAC9IVRw/hqdefault.jpg", minBytes = 8 * 1024),
+                Probe("i.ytimg.com", "", minBytes = CHROME_MIN_BYTES, kind = ProbeKind.ChromeHello),
+                Probe(video, if (videoHost != null) "/generate_204" else "/report_mapping?di=no", minBytes = 12),
+                Probe(video, "", minBytes = CHROME_MIN_BYTES, kind = ProbeKind.ChromeHello),
+            )
+        }
+
+        /**
+         * Шлёт ClientHello как у Chrome и считает, сколько пришло в ответ. Ответ должен начинаться с записи
+         * Handshake (0x16); тревога (0x15) или тишина — значит, DPI или сервер оборвали соединение.
+         */
+        fun chromeHandshake(proxyPort: Int?, host: String, hello: ByteArray, minBytes: Int, timeoutMs: Int): Int {
+            val socket = if (proxyPort != null) {
+                Socks5.connect(proxyPort, host, 443, timeoutMs)
+            } else {
+                Socket().apply {
+                    soTimeout = timeoutMs
+                    connect(java.net.InetSocketAddress(host, 443), timeoutMs)
+                }
+            }
+            socket.use {
+                it.soTimeout = timeoutMs
+                it.getOutputStream().apply {
+                    write(hello)
+                    flush()
+                }
+                val input = it.getInputStream()
+                val buffer = ByteArray(16 * 1024)
+                var total = 0
+                var first = -1
+                while (total < minBytes) {
+                    val n = runCatching { input.read(buffer) }.getOrElse { e -> if (total > 0) -1 else throw e }
+                    if (n < 0) break
+                    if (first < 0 && n > 0) first = buffer[0].toInt() and 0xFF
+                    total += n
+                }
+                if (first == 0x15) throw java.io.IOException("TLS alert")
+                if (first != 0x16 && total > 0) throw java.io.IOException("not TLS")
+                return total
+            }
+        }
+
+        private val VideoHostPattern = Regex("""rr\d{1,2}---sn-[a-z0-9-]+\.googlevideo\.com""")
+
+        /** Читает страницу просмотра потоком, пока не встретится ссылка на видеоузел. */
+        fun findVideoHost(proxyPort: Int?, timeoutMs: Int): String? {
+            val raw = if (proxyPort != null) Socks5.connect(proxyPort, "www.youtube.com", 443, timeoutMs) else Socket("www.youtube.com", 443)
+            raw.use {
+                val tls = (SSLSocketFactory.getDefault() as SSLSocketFactory).createSocket(raw, "www.youtube.com", 443, true) as SSLSocket
+                tls.use {
+                    tls.soTimeout = timeoutMs
+                    tls.startHandshake()
+                    tls.outputStream.apply {
+                        write(httpRequest("www.youtube.com", WATCH_PATH).toByteArray())
+                        flush()
+                    }
+                    val input = tls.inputStream
+                    val buffer = ByteArray(32 * 1024)
+                    var tail = ""
+                    var read = 0
+                    while (read < WATCH_MAX_BYTES) {
+                        val n = input.read(buffer)
+                        if (n < 0) break
+                        read += n
+                        val chunk = tail + String(buffer, 0, n, Charsets.ISO_8859_1)
+                        VideoHostPattern.find(chunk)?.let { m -> return m.value }
+                        tail = chunk.takeLast(80)
+                    }
+                    return null
+                }
+            }
+        }
+
+        private const val WATCH_PATH = "/watch?v=jNQXAC9IVRw"
+        private const val WATCH_MAX_BYTES = 2_000_000
 
         /** Сначала все пройденные проверки, затем скорость. */
         fun rank(scores: List<StrategyScore>): List<StrategyScore> =

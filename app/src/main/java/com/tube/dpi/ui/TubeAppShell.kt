@@ -9,6 +9,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
@@ -133,10 +134,10 @@ private fun HomeScreen(vm: MainViewModel, actions: ShellActions, onOpen: (Sheet)
         TunnelStatus.Stopped -> OrbState.Off
     }
 
+    // Экран не прокручивается: всё помещается, кнопка подстраивается под свободное место.
     Column(
         Modifier
             .fillMaxSize()
-            .verticalScroll(rememberScrollState())
             .statusBarsPadding()
             .navigationBarsPadding()
             .padding(horizontal = 20.dp, vertical = 12.dp),
@@ -151,10 +152,21 @@ private fun HomeScreen(vm: MainViewModel, actions: ShellActions, onOpen: (Sheet)
 
         UpdateBanner(update, vm, actions)
 
-        Spacer(Modifier.height(16.dp))
-        PowerOrb(orb, tr("Включить или выключить обход", "Toggle unblocking"), onClick = {
-            if (status is TunnelStatus.Running || status is TunnelStatus.Starting) vm.toggleTunnel() else actions.start()
-        })
+        BoxWithConstraints(
+            Modifier
+                .weight(1f)
+                .fillMaxWidth(),
+            contentAlignment = Alignment.Center,
+        ) {
+            // Под кнопкой — две-три строки состояния (~90dp).
+            val orbSize = (maxHeight - 96.dp).coerceIn(120.dp, 236.dp)
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                PowerOrb(
+                    orb,
+                    tr("Включить или выключить обход", "Toggle unblocking"),
+                    onClick = { if (status is TunnelStatus.Running || status is TunnelStatus.Starting) vm.toggleTunnel() else actions.start() },
+                    diameter = orbSize,
+                )
 
         AnimatedContent(status, transitionSpec = { fadeIn(Motion.snappy()) togetherWith fadeOut(Motion.snappy()) }, label = "status") { st ->
             Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -199,8 +211,8 @@ private fun HomeScreen(vm: MainViewModel, actions: ShellActions, onOpen: (Sheet)
                 }
             }
         }
-
-        Spacer(Modifier.height(20.dp))
+            }
+        }
 
         AnimatedVisibility(clients.isNotEmpty()) {
             Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -212,7 +224,7 @@ private fun HomeScreen(vm: MainViewModel, actions: ShellActions, onOpen: (Sheet)
                         ClientChip(client.packageName, client.label) { actions.openClient(client.packageName) }
                     }
                 }
-                Spacer(Modifier.height(16.dp))
+                Spacer(Modifier.height(12.dp))
             }
         }
 
@@ -256,7 +268,6 @@ private fun HomeScreen(vm: MainViewModel, actions: ShellActions, onOpen: (Sheet)
             },
             warning = !autostart,
         ) { onOpen(Sheet.Autostart) }
-        Spacer(Modifier.height(24.dp))
     }
 }
 
@@ -345,7 +356,7 @@ private fun InfoCard(
         Column(
             Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 14.dp),
+                .padding(horizontal = 16.dp, vertical = 10.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {

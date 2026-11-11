@@ -63,10 +63,25 @@ class NetworkProbeTest {
     }
 
     @Test
+    fun chromeHelloGetsServerHello() {
+        assumeTrue(System.getProperty("network") == "true")
+        val template = java.io.File("src/main/assets/fake/tls_clienthello_vk_com_kyber.bin").readBytes()
+        val port = relay()
+        val video = StrategyTester.findVideoHost(port, 15000)
+        println("video host: $video")
+        listOfNotNull("www.youtube.com", "i.ytimg.com", video).forEach { host ->
+            val bytes = StrategyTester.chromeHandshake(port, host, ChromeHello.build(template, host), 2000, 8000)
+            println("chrome hello $host: $bytes B")
+            assertTrue(host, bytes >= 2000)
+        }
+        assertTrue(video != null)
+    }
+
+    @Test
     fun probesPassThroughPlainProxy() {
         assumeTrue(System.getProperty("network") == "true")
         val port = relay()
-        val results = StrategyTester.defaultProbes().map { probe ->
+        val results = StrategyTester.defaultProbes().filter { it.kind == ProbeKind.Https }.map { probe ->
             val started = System.currentTimeMillis()
             val bytes = StrategyTester.httpsGet(port, probe.host, probe.path, maxOf(probe.minBytes, 1), 8000)
             println("${probe.host}${probe.path}: ${bytes.size} B, ${System.currentTimeMillis() - started} ms, ${String(bytes).lineSequence().first()}")

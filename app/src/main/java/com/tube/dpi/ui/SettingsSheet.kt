@@ -81,14 +81,14 @@ fun ColumnScope.SettingsSheet(vm: MainViewModel, actions: ShellActions, onAutost
         SettingsCard(tr("Обход", "Unblocking")) {
             ToggleRow(
                 title = tr("Сторож", "Watchdog"),
-                status = tr("Меняет стратегию, если она сломалась", "Switches strategy when it breaks"),
+                status = tr("Меняет сломавшуюся стратегию", "Replaces a broken strategy"),
                 checked = watchdog,
                 onChange = vm::setWatchdog,
             )
             Spacer(Modifier.height(14.dp))
             ToggleRow(
                 title = tr("Блокировать QUIC", "Block QUIC"),
-                status = if (blockQuic) tr("Рекомендуется", "Recommended") else tr("Для стратегии QUIC FAKE", "For the QUIC FAKE strategy"),
+                status = if (blockQuic) null else tr("Нужно только для QUIC FAKE", "Only for QUIC FAKE"),
                 checked = blockQuic,
                 onChange = vm::setBlockQuic,
             )
@@ -151,7 +151,6 @@ fun ColumnScope.SettingsSheet(vm: MainViewModel, actions: ShellActions, onAutost
                 Spacer(Modifier.height(14.dp))
                 ToggleRow(
                     title = tr("Цвета обоев", "Wallpaper colors"),
-                    status = tr("Вместо фирменного зелёного", "Instead of brand green"),
                     checked = dynamic,
                     onChange = vm::setDynamicColors,
                 )
@@ -163,7 +162,6 @@ fun ColumnScope.SettingsSheet(vm: MainViewModel, actions: ShellActions, onAutost
         SettingsCard(tr("Обновления", "Updates")) {
             ToggleRow(
                 title = tr("Проверять на GitHub", "Check on GitHub"),
-                status = tr("Раз в несколько часов", "Every few hours"),
                 checked = checkUpdates,
                 onChange = vm::setCheckUpdates,
             )
