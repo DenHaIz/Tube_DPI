@@ -17,18 +17,21 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -112,163 +115,215 @@ fun TubeAppShell(vm: MainViewModel, actions: ShellActions) {
 
 @Composable
 private fun HomeScreen(vm: MainViewModel, actions: ShellActions, onOpen: (Sheet) -> Unit) {
-    val colors = TubeTheme.colors
-    val lang = LocalLanguage.current
-    val status by vm.status.collectAsStateWithLifecycle()
-    val traffic by vm.traffic.collectAsStateWithLifecycle()
-    val strategy by vm.strategy.collectAsStateWithLifecycle()
-    val targets by vm.targets.collectAsStateWithLifecycle()
-    val installed by vm.installed.collectAsStateWithLifecycle()
-    val clients by vm.clients.collectAsStateWithLifecycle()
-    val autostart by vm.autostartEnabled.collectAsStateWithLifecycle()
-    val stopDelay by vm.stopDelay.collectAsStateWithLifecycle()
-    val results by vm.results.collectAsStateWithLifecycle()
-    val test by vm.test.collectAsStateWithLifecycle()
-    val watchdog by vm.watchdog.collectAsStateWithLifecycle()
     val update by vm.update.collectAsStateWithLifecycle()
 
+    // Экран не прокручивается: всё помещается, кнопка подстраивается под свободное место.
+    BoxWithConstraints(
+        Modifier
+            .fillMaxSize()
+            // Системные панели и вырез камеры: в горизонтальном виде они сбоку.
+            .windowInsetsPadding(WindowInsets.safeDrawing)
+            .padding(horizontal = 20.dp, vertical = 12.dp),
+        contentAlignment = Alignment.TopCenter,
+    ) {
+        // Горизонтальный вид (телефон боком, планшет): кнопка слева, карточки справа.
+        val wide = maxWidth > maxHeight && maxWidth >= 560.dp
+        Column(
+            Modifier
+                .fillMaxHeight()
+                .widthIn(max = if (wide) 1040.dp else 560.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Header(onOpen)
+            UpdateBanner(update, vm, actions)
+            if (wide) {
+                Row(
+                    Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .padding(top = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(24.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    PowerArea(vm, actions, onOpen, Modifier.weight(1f).fillMaxHeight())
+                    Column(
+                        Modifier
+                            .weight(1f)
+                            .fillMaxHeight(),
+                        verticalArrangement = Arrangement.Center,
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Clients(vm, actions)
+                        InfoCards(vm, onOpen)
+                    }
+                }
+            } else {
+                PowerArea(vm, actions, onOpen, Modifier.weight(1f).fillMaxWidth())
+                Clients(vm, actions)
+                InfoCards(vm, onOpen)
+            }
+        }
+    }
+}
+
+@Composable
+private fun Header(onOpen: (Sheet) -> Unit) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Image(painterResource(R.drawable.tube_mark), contentDescription = null, modifier = Modifier.size(44.dp))
+        Spacer(Modifier.size(10.dp))
+        Text("Tube", style = MaterialTheme.typography.headlineSmall, color = TubeTheme.colors.textPrimary, modifier = Modifier.weight(1f))
+        GlassIconButton(TubeIcons.Sliders, tr("Настройки", "Settings")) { onOpen(Sheet.Settings) }
+    }
+}
+
+/** Кнопка обхода и состояние под ней; кнопка занимает всё свободное место по высоте. */
+@Composable
+private fun PowerArea(vm: MainViewModel, actions: ShellActions, onOpen: (Sheet) -> Unit, modifier: Modifier) {
+    val status by vm.status.collectAsStateWithLifecycle()
     val orb = when (status) {
         is TunnelStatus.Running -> OrbState.On
         TunnelStatus.Starting -> OrbState.Starting
         is TunnelStatus.Failed -> OrbState.Failed
         TunnelStatus.Stopped -> OrbState.Off
     }
-
-    // Экран не прокручивается: всё помещается, кнопка подстраивается под свободное место.
-    Column(
-        Modifier
-            .fillMaxSize()
-            .statusBarsPadding()
-            .navigationBarsPadding()
-            .padding(horizontal = 20.dp, vertical = 12.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Image(painterResource(R.drawable.tube_mark), contentDescription = null, modifier = Modifier.size(44.dp))
-            Spacer(Modifier.size(10.dp))
-            Text("Tube", style = MaterialTheme.typography.headlineSmall, color = colors.textPrimary, modifier = Modifier.weight(1f))
-            GlassIconButton(TubeIcons.Sliders, tr("Настройки", "Settings")) { onOpen(Sheet.Settings) }
+    BoxWithConstraints(modifier, contentAlignment = Alignment.Center) {
+        // Под кнопкой — две-три строки состояния (~90dp).
+        val orbSize = (maxHeight - 96.dp).coerceIn(112.dp, 236.dp)
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            PowerOrb(
+                orb,
+                tr("Включить или выключить обход", "Toggle unblocking"),
+                onClick = { if (status is TunnelStatus.Running || status is TunnelStatus.Starting) vm.toggleTunnel() else actions.start() },
+                diameter = orbSize,
+            )
+            StatusText(vm, status, actions, onOpen)
         }
+    }
+}
 
-        UpdateBanner(update, vm, actions)
-
-        BoxWithConstraints(
-            Modifier
-                .weight(1f)
-                .fillMaxWidth(),
-            contentAlignment = Alignment.Center,
-        ) {
-            // Под кнопкой — две-три строки состояния (~90dp).
-            val orbSize = (maxHeight - 96.dp).coerceIn(120.dp, 236.dp)
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                PowerOrb(
-                    orb,
-                    tr("Включить или выключить обход", "Toggle unblocking"),
-                    onClick = { if (status is TunnelStatus.Running || status is TunnelStatus.Starting) vm.toggleTunnel() else actions.start() },
-                    diameter = orbSize,
+@Composable
+private fun StatusText(vm: MainViewModel, status: TunnelStatus, actions: ShellActions, onOpen: (Sheet) -> Unit) {
+    val colors = TubeTheme.colors
+    val lang = LocalLanguage.current
+    val traffic by vm.traffic.collectAsStateWithLifecycle()
+    val watchdog by vm.watchdog.collectAsStateWithLifecycle()
+    AnimatedContent(status, transitionSpec = { fadeIn(Motion.snappy()) togetherWith fadeOut(Motion.snappy()) }, label = "status") { st ->
+        Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+            val title = when (st) {
+                is TunnelStatus.Running -> tr("Обход включён", "Unblocking is on")
+                TunnelStatus.Starting -> tr("Запуск…", "Starting…")
+                is TunnelStatus.Failed -> lang.failMessage(st.reason)
+                TunnelStatus.Stopped -> tr("Обход выключен", "Unblocking is off")
+            }
+            FitText(title, style = MaterialTheme.typography.titleLarge, color = if (st is TunnelStatus.Failed) colors.danger else colors.textPrimary)
+            val subtitle = when (st) {
+                is TunnelStatus.Running -> "↓ ${lang.bytes(traffic.rxBytes)} · ${lang.rate(traffic.rxRate)}"
+                TunnelStatus.Stopped -> tr("Нажмите, чтобы включить", "Tap to turn on")
+                is TunnelStatus.Failed -> st.details?.lineSequence()?.firstOrNull()?.take(80)
+                TunnelStatus.Starting -> null
+            }
+            if (subtitle != null) {
+                Text(subtitle, style = MaterialTheme.typography.bodyMedium, color = colors.textSecondary, textAlign = TextAlign.Center, maxLines = 2, modifier = Modifier.padding(top = 2.dp))
+            }
+            val check = watchdog
+            if (st is TunnelStatus.Running && check != null) {
+                Text(
+                    if (check.ok) tr("✓ YouTube доступен · ${lang.ago(check.checkedAt)}", "✓ YouTube reachable · ${lang.ago(check.checkedAt)}")
+                    else tr("✕ YouTube не отвечает — ищу замену", "✕ YouTube not responding — finding a fix"),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = if (check.ok) colors.success else colors.warning,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(top = 2.dp),
                 )
-
-        AnimatedContent(status, transitionSpec = { fadeIn(Motion.snappy()) togetherWith fadeOut(Motion.snappy()) }, label = "status") { st ->
-            Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-                val title = when (st) {
-                    is TunnelStatus.Running -> tr("Обход включён", "Unblocking is on")
-                    TunnelStatus.Starting -> tr("Запуск…", "Starting…")
-                    is TunnelStatus.Failed -> lang.failMessage(st.reason)
-                    TunnelStatus.Stopped -> tr("Обход выключен", "Unblocking is off")
-                }
-                FitText(title, style = MaterialTheme.typography.titleLarge, color = if (st is TunnelStatus.Failed) colors.danger else colors.textPrimary)
-                val subtitle = when (st) {
-                    is TunnelStatus.Running -> "↓ ${lang.bytes(traffic.rxBytes)} · ${lang.rate(traffic.rxRate)}"
-                    TunnelStatus.Stopped -> tr("Нажмите, чтобы включить", "Tap to turn on")
-                    is TunnelStatus.Failed -> st.details?.lineSequence()?.firstOrNull()?.take(80)
-                    TunnelStatus.Starting -> null
-                }
-                if (subtitle != null) {
-                    Text(subtitle, style = MaterialTheme.typography.bodyMedium, color = colors.textSecondary, textAlign = TextAlign.Center, modifier = Modifier.padding(top = 2.dp))
-                }
-                val check = watchdog
-                if (st is TunnelStatus.Running && check != null) {
-                    Text(
-                        if (check.ok) tr("✓ YouTube доступен · ${lang.ago(check.checkedAt)}", "✓ YouTube reachable · ${lang.ago(check.checkedAt)}")
-                        else tr("✕ YouTube не отвечает — ищу замену", "✕ YouTube not responding — finding a fix"),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = if (check.ok) colors.success else colors.warning,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.padding(top = 2.dp),
-                    )
-                }
-                if (st is TunnelStatus.Failed) {
-                    Spacer(Modifier.height(10.dp))
-                    when (st.reason) {
-                        FailReason.NoConsent, FailReason.Revoked, FailReason.TunnelFailed ->
-                            PillButton(tr("Включить снова", "Turn on again"), onClick = actions.start, compact = true)
-                        FailReason.NoApps -> PillButton(tr("Выбрать приложения", "Choose apps"), onClick = { onOpen(Sheet.Apps) }, compact = true)
-                        FailReason.ProxyFailed -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            PillButton(tr("Стратегия", "Strategy"), onClick = { onOpen(Sheet.Strategy) }, compact = true)
-                            PillButton(tr("Журнал", "Log"), onClick = { onOpen(Sheet.Log) }, compact = true)
-                        }
+            }
+            if (st is TunnelStatus.Failed) {
+                Spacer(Modifier.height(10.dp))
+                when (st.reason) {
+                    FailReason.NoConsent, FailReason.Revoked, FailReason.TunnelFailed ->
+                        PillButton(tr("Включить снова", "Turn on again"), onClick = actions.start, compact = true)
+                    FailReason.NoApps -> PillButton(tr("Выбрать приложения", "Choose apps"), onClick = { onOpen(Sheet.Apps) }, compact = true)
+                    FailReason.ProxyFailed -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        PillButton(tr("Стратегия", "Strategy"), onClick = { onOpen(Sheet.Strategy) }, compact = true)
+                        PillButton(tr("Журнал", "Log"), onClick = { onOpen(Sheet.Log) }, compact = true)
                     }
                 }
             }
         }
-            }
-        }
+    }
+}
 
-        AnimatedVisibility(clients.isNotEmpty()) {
-            Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-                FlowRow(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    clients.forEach { client ->
+@Composable
+private fun Clients(vm: MainViewModel, actions: ShellActions) {
+    val clients by vm.clients.collectAsStateWithLifecycle()
+    AnimatedVisibility(clients.isNotEmpty()) {
+        Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                clients.forEach { client ->
+                    key(client.packageName) {
                         ClientChip(client.packageName, client.label) { actions.openClient(client.packageName) }
                     }
                 }
-                Spacer(Modifier.height(12.dp))
             }
+            Spacer(Modifier.height(12.dp))
         }
-
-        val score = results?.scores?.get(strategy.id)
-        val working = results?.working?.size ?: 0
-        InfoCard(
-            icon = TubeIcons.Bolt,
-            title = tr("Стратегия", "Strategy"),
-            value = strategy.name + (score?.takeIf { it.works }?.let { " · ${it.avgMillis} ${lang.pick("мс", "ms")}" } ?: ""),
-            hint = when {
-                test.running -> tr("Подбор: ${test.done} из ${test.total}", "Testing: ${test.done} of ${test.total}")
-                results == null || results?.testedAt == 0L -> tr("Нажмите, чтобы подобрать", "Tap to auto-pick")
-                else -> tr("Рабочих в этой сети: $working", "Working on this network: $working")
-            },
-            warning = results != null && results?.testedAt != 0L && working == 0,
-        ) { onOpen(Sheet.Strategy) }
-        Spacer(Modifier.height(10.dp))
-
-        val selectedNames = installed.orEmpty().filter { it.packageName in targets }.map { it.label }
-        InfoCard(
-            icon = TubeIcons.Apps,
-            title = tr("Приложения", "Apps"),
-            value = when {
-                installed == null -> "…"
-                selectedNames.isEmpty() -> tr("Не выбраны", "None selected")
-                else -> lang.plural(selectedNames.size, "${selectedNames.size} приложение", "${selectedNames.size} приложения", "${selectedNames.size} приложений", "${selectedNames.size} app", "${selectedNames.size} apps")
-            },
-            hint = selectedNames.take(3).joinToString(", ").ifEmpty { tr("Остальные идут напрямую", "Others go direct") },
-            warning = installed != null && selectedNames.isEmpty(),
-        ) { onOpen(Sheet.Apps) }
-        Spacer(Modifier.height(10.dp))
-
-        InfoCard(
-            icon = TubeIcons.Eye,
-            title = tr("Запуск с YouTube", "Start with YouTube"),
-            value = if (autostart) tr("Включён", "On") else tr("Выключен", "Off"),
-            hint = when {
-                !autostart -> tr("Нажмите, чтобы настроить", "Tap to set up")
-                stopDelay == 0 -> tr("Не выключается сам", "Stays on")
-                else -> tr("Выключение через ${lang.stopDelay(stopDelay)}", "Turns off after ${lang.stopDelay(stopDelay)}")
-            },
-            warning = !autostart,
-        ) { onOpen(Sheet.Autostart) }
     }
+}
+
+@Composable
+private fun InfoCards(vm: MainViewModel, onOpen: (Sheet) -> Unit) {
+    val lang = LocalLanguage.current
+    val strategy by vm.strategy.collectAsStateWithLifecycle()
+    val targets by vm.targets.collectAsStateWithLifecycle()
+    val installed by vm.installed.collectAsStateWithLifecycle()
+    val autostart by vm.autostartEnabled.collectAsStateWithLifecycle()
+    val stopDelay by vm.stopDelay.collectAsStateWithLifecycle()
+    val results by vm.results.collectAsStateWithLifecycle()
+    val test by vm.test.collectAsStateWithLifecycle()
+
+    val score = results?.scores?.get(strategy.id)
+    val working = results?.working?.size ?: 0
+    val tested = results?.testedAt?.let { it != 0L } == true
+    InfoCard(
+        icon = TubeIcons.Bolt,
+        title = tr("Стратегия", "Strategy"),
+        value = strategy.name + (score?.takeIf { it.works }?.let { " · ${it.avgMillis} ${lang.pick("мс", "ms")}" } ?: ""),
+        hint = when {
+            test.running -> tr("Подбор: ${test.done} из ${test.total}", "Testing: ${test.done} of ${test.total}")
+            !tested -> tr("Нажмите, чтобы подобрать", "Tap to auto-pick")
+            else -> tr("Рабочих в этой сети: $working", "Working on this network: $working")
+        },
+        warning = tested && working == 0,
+    ) { onOpen(Sheet.Strategy) }
+    Spacer(Modifier.height(10.dp))
+
+    val selectedNames = remember(installed, targets) { installed.orEmpty().filter { it.packageName in targets }.map { it.label } }
+    InfoCard(
+        icon = TubeIcons.Apps,
+        title = tr("Приложения", "Apps"),
+        value = when {
+            installed == null -> "…"
+            selectedNames.isEmpty() -> tr("Не выбраны", "None selected")
+            else -> lang.plural(selectedNames.size, "${selectedNames.size} приложение", "${selectedNames.size} приложения", "${selectedNames.size} приложений", "${selectedNames.size} app", "${selectedNames.size} apps")
+        },
+        hint = selectedNames.take(3).joinToString(", ").ifEmpty { tr("Остальные идут напрямую", "Others go direct") },
+        warning = installed != null && selectedNames.isEmpty(),
+    ) { onOpen(Sheet.Apps) }
+    Spacer(Modifier.height(10.dp))
+
+    InfoCard(
+        icon = TubeIcons.Eye,
+        title = tr("Запуск с YouTube", "Start with YouTube"),
+        value = if (autostart) tr("Включён", "On") else tr("Выключен", "Off"),
+        hint = when {
+            !autostart -> tr("Нажмите, чтобы настроить", "Tap to set up")
+            stopDelay == 0 -> tr("Не выключается сам", "Stays on")
+            else -> tr("Выключение через ${lang.stopDelay(stopDelay)}", "Turns off after ${lang.stopDelay(stopDelay)}")
+        },
+        warning = !autostart,
+    ) { onOpen(Sheet.Autostart) }
 }
 
 /** Плашка новой версии: что нового и кнопка обновления с прогрессом скачивания. */
@@ -388,13 +443,18 @@ private fun ClientChip(packageName: String, label: String, onClick: () -> Unit) 
     }
 }
 
+private val IconCache = android.util.LruCache<String, ImageBitmap>(64)
+
 /** Значок установленного приложения; грузится в фоне, пока — пустое место. */
 @Composable
 fun AppIcon(packageName: String, modifier: Modifier = Modifier) {
     val context = LocalContext.current
-    val icon by produceState<ImageBitmap?>(null, packageName) {
+    // Кэш: при прокрутке списка приложений значки не декодируются заново.
+    val icon by produceState(IconCache.get(packageName), packageName) {
+        if (value != null) return@produceState
         value = withContext(Dispatchers.IO) {
             runCatching { context.packageManager.getApplicationIcon(packageName).toBitmap(96, 96).asImageBitmap() }.getOrNull()
+                ?.also { IconCache.put(packageName, it) }
         }
     }
     Box(modifier.clip(Shapes.Chip)) {

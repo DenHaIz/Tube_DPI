@@ -18,6 +18,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
@@ -39,7 +41,9 @@ class AutoStartService : AccessibilityService() {
         super.onServiceConnected()
         val settings = (application as TubeApp).container.settings
         policy = AutoStartPolicy(packageName)
-        targets = settings.targets.map { it ?: TargetApps.defaultTargets(this) }
+        // Перебор всех установленных приложений — не на главном потоке и только когда список правда изменился.
+        targets = settings.targets.distinctUntilChanged().map { it ?: TargetApps.defaultTargets(this) }
+            .flowOn(Dispatchers.Default)
             .stateIn(scope, SharingStarted.Eagerly, emptySet())
         stopDelayMs = settings.stopDelayMinutes.map { minutes -> if (minutes <= 0) null else minutes * 60_000L }
             .stateIn(scope, SharingStarted.Eagerly, 5 * 60_000L)
@@ -71,8 +75,15 @@ class AutoStartService : AccessibilityService() {
             stopDelayMs = stopDelayMs.value,
             now = System.currentTimeMillis(),
         )
-        if (decision == AutoStartPolicy.Decision.Start) VpnController.start(this, byAutostart = true)
+        if (decision != AutoStartPolicy.Decision.Start) return
+        // После сбоя запуска не повторяем его на каждое переключение окна YouTube — иначе уведомления сыплются подряд.
+        val now = System.currentTimeMillis()
+        if (status is TunnelStatus.Failed && now - lastAttempt < RETRY_AFTER_FAILURE_MS) return
+        lastAttempt = now
+        VpnController.start(this, byAutostart = true)
     }
+
+    private var lastAttempt = 0L
 
     private fun inputMethods(): Set<String> = runCatching {
         getSystemService(InputMethodManager::class.java).enabledInputMethodList.map { it.packageName }.toSet()
@@ -87,6 +98,7 @@ class AutoStartService : AccessibilityService() {
 
     companion object {
         private const val TICK_MS = 15_000L
+        private const val RETRY_AFTER_FAILURE_MS = 2 * 60_000L
 
         /** Включена ли служба в настройках спецвозможностей. */
         fun isEnabled(context: Context): Boolean {

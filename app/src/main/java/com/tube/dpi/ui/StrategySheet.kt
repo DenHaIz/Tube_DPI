@@ -74,20 +74,25 @@ fun ColumnScope.StrategySheet(vm: MainViewModel, onShowLog: () -> Unit) {
     var expanded by rememberSaveable { mutableStateOf<String?>(null) }
 
     val scores = results?.scores.orEmpty()
-    val custom = customArgs.takeIf { it.isNotBlank() }?.let { Strategy(Strategies.CUSTOM_ID, "CUSTOM", it, "Своя стратегия", "Custom strategy") }
-    // Набор ByeByeDPI показываем, только если он проверялся; внутри групп — сначала надёжные и быстрые.
-    val candidates = Strategies.builtIn + listOfNotNull(custom) + Strategies.extended.filter { it.id in scores || it.id == selectedId }
-    fun groupOf(s: Strategy): Group {
-        if (s.id == selectedId) return Group.Current
-        val score = scores[s.id] ?: return Group.Untested
-        return when {
-            score.works -> Group.Working
-            score.passed > 0 -> Group.Partial
-            else -> Group.Failed
+    // Группировка и сортировка — только когда изменились результаты или выбор, а не на каждый кадр/прогресс.
+    val grouped = remember(scores, selectedId, customArgs) {
+        val custom = customArgs.takeIf { it.isNotBlank() }?.let { Strategy(Strategies.CUSTOM_ID, "CUSTOM", it, "Своя стратегия", "Custom strategy") }
+        // Набор ByeByeDPI показываем, только если он проверялся; внутри групп — сначала надёжные и быстрые.
+        val candidates = Strategies.builtIn + listOfNotNull(custom) + Strategies.extended.filter { it.id in scores || it.id == selectedId }
+        fun groupOf(s: Strategy): Group {
+            if (s.id == selectedId) return Group.Current
+            val score = scores[s.id] ?: return Group.Untested
+            return when {
+                score.works -> Group.Working
+                score.passed > 0 -> Group.Partial
+                else -> Group.Failed
+            }
         }
+        val passed = candidates.associate { it.id to (scores[it.id]?.passed ?: -1) }
+        val speed = candidates.associate { it.id to (scores[it.id]?.avgMillis ?: Long.MAX_VALUE) }
+        val order = compareByDescending<Strategy> { passed[it.id] }.thenBy { speed[it.id] }
+        candidates.groupBy(::groupOf).mapValues { (_, list) -> list.sortedWith(order) }
     }
-    val order = compareByDescending<Strategy> { scores[it.id]?.passed ?: -1 }.thenBy { scores[it.id]?.avgMillis ?: Long.MAX_VALUE }
-    val grouped = candidates.groupBy(::groupOf).mapValues { (_, list) -> list.sortedWith(order) }
 
     val subtitle = network?.let { id ->
         lang.networkLabel(id) + (results?.testedAt?.takeIf { it > 0 }?.let { " · " + lang.ago(it) } ?: "")
@@ -95,7 +100,11 @@ fun ColumnScope.StrategySheet(vm: MainViewModel, onShowLog: () -> Unit) {
     SheetTitle(tr("Стратегия", "Strategy"), subtitle)
     Spacer(Modifier.height(8.dp))
 
-    val rowArgs = RowArgs(scores, selectedId, expanded, testingId, test.running, fakeSni, vm) { id -> expanded = if (expanded == id) null else id }
+    // Один экземпляр, пока не изменилось ничего, что видно в строках: прогресс подбора не перерисовывает весь список.
+    val running = test.running
+    val rowArgs = remember(scores, selectedId, expanded, testingId, running, fakeSni) {
+        RowArgs(scores, selectedId, expanded, testingId, running, fakeSni, vm) { id -> expanded = if (expanded == id) null else id }
+    }
     LazyColumn(
         Modifier
             .weight(1f, fill = false)

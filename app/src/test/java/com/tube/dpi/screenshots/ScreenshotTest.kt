@@ -121,6 +121,43 @@ class ScreenshotTest {
     }
 
     @Test
+    @Config(qualifiers = "w860dp-h400dp-land-xxhdpi")
+    fun homeLandscapePhone() {
+        TunnelState.set(TunnelStatus.Running(System.currentTimeMillis(), "DISORDER SNI", byAutostart = false))
+        TunnelState.setWatchdog(com.tube.dpi.vpn.WatchdogStatus(System.currentTimeMillis(), ok = true))
+        fakeResults()
+        render(dark = true)
+        shot("home_landscape_phone")
+    }
+
+    @Test
+    @Config(qualifiers = "w1280dp-h800dp-land-mdpi")
+    fun homeTabletLandscape() {
+        fakeResults()
+        render(dark = false)
+        shot("home_tablet_land")
+    }
+
+    @Test
+    @Config(qualifiers = "w800dp-h1280dp-port-mdpi")
+    fun strategySheetTabletPortrait() {
+        fakeResults()
+        render(dark = true)
+        compose.onNodeWithText("Стратегия").performClick()
+        compose.waitForIdle()
+        shot("sheet_strategy_tablet")
+    }
+
+    @Test
+    @Config(qualifiers = "w860dp-h400dp-land-xxhdpi")
+    fun settingsSheetLandscape() {
+        render(dark = false)
+        compose.onNodeWithContentDescription("Настройки").performClick()
+        compose.waitForIdle()
+        shot("sheet_settings_landscape")
+    }
+
+    @Test
     fun homeFailedEnglish() {
         TunnelState.set(TunnelStatus.Failed(FailReason.ProxyFailed, "ciadpi: invalid value: -s"))
         render(dark = true, lang = AppLanguage.English)

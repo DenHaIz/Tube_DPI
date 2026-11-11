@@ -2,6 +2,8 @@ package com.tube.dpi.update
 
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageInfo
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
@@ -18,9 +20,18 @@ import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.MessageDigest
 
 /** Релиз на GitHub, который новее установленной версии. */
-data class Release(val version: String, val notes: String, val apkUrl: String, val apkSize: Long, val pageUrl: String)
+data class Release(
+    val version: String,
+    val notes: String,
+    val apkUrl: String,
+    val apkSize: Long,
+    val pageUrl: String,
+    /** SHA-256 файла из API GitHub; null — проверяем только подпись. */
+    val sha256: String? = null,
+)
 
 sealed interface UpdateState {
     data object Idle : UpdateState
@@ -58,35 +69,109 @@ class UpdateChecker(private val context: Context, private val settings: Settings
         )
     }
 
+    /**
+     * Скачивает APK: сначала с GitHub, затем через зеркала. Файл с каждого источника проверяется —
+     * размер, SHA-256 из релиза (если известен), имя пакета, версия и подпись (та же, что у установленного приложения), —
+     * поэтому подменённый зеркалом файл не дойдёт до установщика.
+     */
     suspend fun download(release: Release) {
+        // Второе нажатие во время скачивания не запускает параллельную запись в тот же файл.
+        if (_state.value is UpdateState.Downloading) return
         _state.value = UpdateState.Downloading(release, 0f)
         val result = withContext(Dispatchers.IO) {
             runCatching {
                 val dir = File(context.cacheDir, "updates").apply { mkdirs() }
                 dir.listFiles()?.forEach { it.delete() }
                 val file = File(dir, "Tube-${release.version}.apk")
-                val connection = open(release.apkUrl)
-                connection.inputStream.use { input ->
-                    file.outputStream().use { output ->
-                        val total = connection.contentLengthLong.takeIf { it > 0 } ?: release.apkSize
-                        val buffer = ByteArray(64 * 1024)
-                        var read = 0L
-                        while (true) {
-                            val n = input.read(buffer)
-                            if (n < 0) break
-                            output.write(buffer, 0, n)
-                            read += n
-                            if (total > 0) _state.value = UpdateState.Downloading(release, read / total.toFloat())
-                        }
+                var lastError: Exception? = null
+                for (url in mirrorsOf(release.apkUrl)) {
+                    try {
+                        fetchTo(url, file, release)
+                        verify(file, release)
+                        return@runCatching file
+                    } catch (e: Exception) {
+                        lastError = e
+                        file.delete()
+                        _state.value = UpdateState.Downloading(release, 0f)
                     }
                 }
-                file
+                throw lastError ?: IllegalStateException("no mirrors")
             }
         }
         _state.value = result.fold(
             onSuccess = { UpdateState.Ready(release, it) },
             onFailure = { UpdateState.Failed(it.message ?: it.javaClass.simpleName) },
         )
+    }
+
+    private fun fetchTo(url: String, file: File, release: Release) {
+        val connection = open(url)
+        try {
+            connection.inputStream.use { input ->
+                file.outputStream().use { output ->
+                    val total = connection.contentLengthLong.takeIf { it > 0 } ?: release.apkSize
+                    val buffer = ByteArray(64 * 1024)
+                    var read = 0L
+                    var shown = -1
+                    while (true) {
+                        val n = input.read(buffer)
+                        if (n < 0) break
+                        output.write(buffer, 0, n)
+                        read += n
+                        if (read > MAX_APK_BYTES) error("file too large")
+                        // Не чаще раза на процент: каждое значение перерисовывает экран.
+                        val percent = if (total > 0) (read * 100 / total).toInt() else -1
+                        if (percent != shown && percent >= 0) {
+                            shown = percent
+                            _state.value = UpdateState.Downloading(release, (percent / 100f).coerceAtMost(1f))
+                        }
+                    }
+                }
+            }
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun verify(file: File, release: Release) {
+        if (release.apkSize > 0 && file.length() != release.apkSize) error("size mismatch")
+        release.sha256?.let { expected ->
+            val md = MessageDigest.getInstance("SHA-256")
+            file.inputStream().use { input ->
+                val buffer = ByteArray(64 * 1024)
+                while (true) {
+                    val n = input.read(buffer)
+                    if (n < 0) break
+                    md.update(buffer, 0, n)
+                }
+            }
+            val actual = md.digest().joinToString("") { "%02x".format(it) }
+            if (!actual.equals(expected, ignoreCase = true)) error("checksum mismatch")
+        }
+        val pm = context.packageManager
+        val archive = archiveInfo(pm, file.absolutePath) ?: error("not an APK")
+        if (archive.packageName != context.packageName) error("wrong package")
+        if (!isNewer(archive.versionName.orEmpty(), BuildConfig.VERSION_NAME)) error("not newer")
+        val installed = signatures(installedInfo(pm))
+        val incoming = signatures(archive)
+        if (installed.isNotEmpty() && incoming.isNotEmpty() && installed != incoming) error("signature mismatch")
+    }
+
+    @Suppress("DEPRECATION")
+    private fun archiveInfo(pm: PackageManager, path: String): PackageInfo? =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) pm.getPackageArchiveInfo(path, PackageManager.GET_SIGNING_CERTIFICATES)
+        else pm.getPackageArchiveInfo(path, PackageManager.GET_SIGNATURES)
+
+    @Suppress("DEPRECATION")
+    private fun installedInfo(pm: PackageManager): PackageInfo? = runCatching {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) pm.getPackageInfo(context.packageName, PackageManager.GET_SIGNING_CERTIFICATES)
+        else pm.getPackageInfo(context.packageName, PackageManager.GET_SIGNATURES)
+    }.getOrNull()
+
+    @Suppress("DEPRECATION")
+    private fun signatures(info: PackageInfo?): Set<String> {
+        val list = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) info?.signingInfo?.apkContentsSigners else info?.signatures
+        return list.orEmpty().map { it.toCharsString() }.toSet()
     }
 
     /** Разрешено ли приложению ставить APK (Android 8+ спрашивает отдельно для каждого источника). */
@@ -106,32 +191,54 @@ class UpdateChecker(private val context: Context, private val settings: Settings
         _state.value = UpdateState.Idle
     }
 
-    /** API GitHub, а если он недоступен (лимит 60 запросов в час на IP у мобильных операторов) — страница релиза. */
-    private fun fetchLatest(): Release? = try {
-        fetchFromApi()
-    } catch (api: Exception) {
-        runCatching { fetchFromPage() }.getOrElse { throw api }
+    /**
+     * Где узнать последнюю версию, по очереди: API GitHub, API через зеркало, страница релиза (редирект на тег)
+     * напрямую и через зеркала. API даёт ещё и SHA-256 файла; страница — только номер версии.
+     */
+    private fun fetchLatest(): Release? {
+        var lastError: Exception? = null
+        val sources: List<() -> Release?> = listOf<() -> Release?>(
+            { fetchFromApi(LATEST_URL) },
+            { fetchFromApi(API_MIRROR + LATEST_URL) },
+            { fetchFromPage(LATEST_PAGE) },
+        ) + PAGE_MIRRORS.map { mirror -> { fetchFromPage(mirror + LATEST_PAGE) } }
+        for (source in sources) {
+            try {
+                return source()
+            } catch (e: Exception) {
+                lastError = e
+            }
+        }
+        throw lastError ?: IllegalStateException("no sources")
     }
 
-    private fun fetchFromApi(): Release? {
-        val connection = open(LATEST_URL, "Accept" to "application/vnd.github+json")
-        val json = JSONObject(connection.inputStream.bufferedReader().use { it.readText() })
-        val version = json.getString("tag_name").removePrefix("v")
+    private fun fetchFromApi(url: String): Release? {
+        val connection = open(url, "Accept" to "application/vnd.github+json")
+        val json = try {
+            JSONObject(connection.inputStream.bufferedReader().use { it.readText() })
+        } finally {
+            connection.disconnect()
+        }
+        val tag = json.getString("tag_name").takeIf { TagPattern.matches(it) } ?: error("bad tag")
+        val version = tag.removePrefix("v")
         if (!isNewer(version, BuildConfig.VERSION_NAME)) return null
         val assets = json.getJSONArray("assets")
-        val apk = (0 until assets.length()).map { assets.getJSONObject(it) }.firstOrNull { it.getString("name").endsWith(".apk") } ?: return null
+        val apk = (0 until assets.length()).map { assets.getJSONObject(it) }
+            .firstOrNull { ApkPattern.matches(it.getString("name")) } ?: return null
         return Release(
             version = version,
             notes = json.optString("body"),
-            apkUrl = apk.getString("browser_download_url"),
+            // Адрес собираем сами: ответ мог прийти через зеркало.
+            apkUrl = "$REPO_URL/releases/download/$tag/${apk.getString("name")}",
             apkSize = apk.optLong("size"),
-            pageUrl = json.optString("html_url"),
+            pageUrl = "$REPO_URL/releases/tag/$tag",
+            sha256 = apk.optString("digest").removePrefix("sha256:").takeIf { it.length == 64 },
         )
     }
 
-    /** github.com/…/releases/latest перенаправляет на …/tag/vX.Y; APK у каждого релиза называется Tube-X.Y.apk. */
-    private fun fetchFromPage(): Release? {
-        val connection = (URL(LATEST_PAGE).openConnection() as HttpURLConnection).apply {
+    /** …/releases/latest перенаправляет на …/tag/vX.Y; APK у каждого релиза называется Tube-X.Y.apk. */
+    private fun fetchFromPage(url: String): Release? {
+        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
             connectTimeout = 10_000
             readTimeout = 20_000
             instanceFollowRedirects = false
@@ -142,7 +249,7 @@ class UpdateChecker(private val context: Context, private val settings: Settings
         } finally {
             connection.disconnect()
         }
-        val tag = location.substringAfterLast("/tag/", "").takeIf { it.isNotEmpty() } ?: error("no release")
+        val tag = location.substringAfterLast("/tag/", "").takeIf { TagPattern.matches(it) } ?: error("no release")
         val version = tag.removePrefix("v")
         if (!isNewer(version, BuildConfig.VERSION_NAME)) return null
         return Release(
@@ -176,6 +283,18 @@ class UpdateChecker(private val context: Context, private val settings: Settings
         private const val LATEST_URL = "https://api.github.com/repos/DenHaIz/Tube_DPI/releases/latest"
         private const val LATEST_PAGE = "$REPO_URL/releases/latest"
         private const val AUTO_INTERVAL_MS = 6 * 60 * 60_000L
+        private const val MAX_APK_BYTES = 100L * 1024 * 1024
+
+        /** Прокси GitHub для сетей, где github.com или его CDN недоступны (проверены: отдают APK целиком). */
+        private val DOWNLOAD_MIRRORS = listOf("https://ghfast.top/", "https://gh-proxy.com/", "https://gh-proxy.org/", "https://ghproxy.net/")
+        private const val API_MIRROR = "https://gh-proxy.com/"
+        private val PAGE_MIRRORS = listOf("https://ghfast.top/", "https://ghproxy.net/")
+
+        private val TagPattern = Regex("""v\d+(\.\d+){0,3}""")
+        private val ApkPattern = Regex("""Tube-\d+(\.\d+){0,3}\.apk""")
+
+        /** Прямая ссылка, затем она же через зеркала. */
+        fun mirrorsOf(url: String): List<String> = listOf(url) + DOWNLOAD_MIRRORS.map { it + url }
 
         /** Сравнение версий по числам: 0.10 > 0.9, 1.0 > 0.9.9. */
         fun isNewer(candidate: String, current: String): Boolean {

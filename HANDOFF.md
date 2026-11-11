@@ -25,7 +25,7 @@ YouTube / ReVanced / Morphe ─► TUN (VpnService, addAllowedApplication)
 
 | Модуль | Что внутри |
 |---|---|
-| `core-byedpi` | byedpi (submodule) собирается **исполняемым** `libbyedpi.so` (свой Gradle-таск `BuildByeDpi`); `ByeDpiProcess`, `StrategyArgs` (разбор/проверка аргументов), `Strategies` (19 своих + 60 из ByeByeDPI в `ByeByeDpiPack`), `StrategyTester`, `ChromeHello`, `LocalDns`, `Socks5`; `assets/fake` — фейковые ClientHello/QUIC из zapret |
+| `core-byedpi` | byedpi (submodule) собирается **исполняемым** `libbyedpi.so` (свой Gradle-таск `BuildByeDpi`); `ByeDpiProcess`, `StrategyArgs` (разбор/проверка аргументов, `@fake/` только по имени файла), `Strategies` (41 своя + 60 из ByeByeDPI в `ByeByeDpiPack`), `StrategyTester`, `ChromeHello`, `LocalDns`, `Socks5`; `assets/fake` — фейковые ClientHello/QUIC из zapret |
 | `core-tunnel` | hev-socks5-tunnel (submodule, ndk-build) + JNI `TProxyService`, генератор `TunnelConfig` |
 | `core-ui` | тема `TubeTheme`, стекло, пружины, `GlassSheet`, `LiquidSegmented`, строки настроек (`ToggleRow`, `PermissionRow`, `PillButton`, `SheetTitle`) |
 | `app` | `vpn/TubeVpnService`, `VpnController`, `TunnelState`; `autostart/` (служба спецвозможностей + чистая `AutoStartPolicy`); `strategy/AutoPick`, `StrategyWatchdog`; `data/` (настройки, `NetworkMonitor`, `ResultsStore`); `update/UpdateChecker`; `tile/`, `LaunchActivity` (ярлык); `ui/` |
@@ -36,7 +36,10 @@ YouTube / ReVanced / Morphe ─► TUN (VpnService, addAllowedApplication)
 - **mapdns в hev** выдаёт приложениям адреса из 198.19.0.0/16 (не 100.64/10 — это CGNAT мобильных операторов) и передаёт в SOCKS имя сайта.
 - **QUIC** по умолчанию запрещён (`byedpi -U`): YouTube уходит на TCP, где работает desync.
 - **Порты byedpi случайные свободные** (`ByeDpiProcess.freePort`) — и у VPN, и у тестера: фиксированные порты сталкивались (сторож и «Проверить» одновременно → «ошибка»). `start` ждёт, пока порт освободится, `stop` ждёт смерти процесса.
-- **byedpi резолвит имена синхронно в единственном потоке** — пока ждёт DNS, стоят все соединения. Поэтому `LocalDns` держит keep-alive к DoH, отдаёт устаревший ответ сразу (обновляя в фоне, до суток) и при старте VPN/подбора заранее запрашивает адреса YouTube и кластера видеоузлов (`prefetch`).
+- **byedpi резолвит имена синхронно в единственном потоке** — пока ждёт DNS, стоят все соединения. Поэтому `LocalDns` держит keep-alive к DoH, отдаёт устаревший ответ сразу (обновляя в фоне, до суток) и при старте VPN/подбора заранее запрашивает адреса YouTube и кластера видеоузлов (`prefetch`). Запросы byedpi и фоновые обновления — в разных ограниченных пулах; одинаковые запросы объединяются; сначала опрашивается последний ответивший DoH, через 1,2 с — остальные параллельно; при неудаче сразу SERVFAIL. `tube_dns.c`: `connect()`-сокет (чужие датаграммы отбрасываются), id из `arc4random`, проверка QR, 2 попытки по 2,5 с.
+- **Сервис VPN** (`TubeVpnService`): все изменения под `Mutex`; останавливается только по последней команде (`stopSelfResult(startId)`), поэтому «выкл → вкл» подряд не убивает новый туннель. Перезапуск поднимает новый byedpi и новый TUN до закрытия старых — трафик YouTube не уходит мимо VPN. Ошибки запуска → `Failed`, а не падение процесса (`CoroutineExceptionHandler`). `onDestroy` отменяет запуск и разбирает туннель под замком в `container.scope`.
+- **ResultsStore** пишет `results.json` через `AtomicFile`, в фоне и не чаще раза в 1,5 с (подбор шлёт ~100 обновлений).
+- **AutoPick** — один подбор за раз (`AtomicBoolean`), «Стоп» отменяет и подбор, запущенный сторожем. Запуск byedpi в тестере не прерывается отменой (`NonCancellable`) и всегда останавливается — процессы не теряются.
 - **Tube не входит в собственный VPN**, поэтому соединения byedpi идут напрямую, `protect()` не нужен.
 
 ### Подбор стратегий (`AutoPick` + `StrategyTester`)
@@ -60,7 +63,7 @@ YouTube / ReVanced / Morphe ─► TUN (VpnService, addAllowedApplication)
 
 ### Обновления
 
-`UpdateChecker` читает `api.github.com/repos/DenHaIz/Tube_DPI/releases/latest` (если API недоступен или лимит 60 запросов/час — редирект `github.com/…/releases/latest` → `/tag/vX.Y`, APK `Tube-X.Y.apk`), сравнивает `tag_name` с `versionName`, качает первый `.apk` из ассетов в `cacheDir/updates` и открывает системный установщик через FileProvider (`${applicationId}.files`). **Значит, у каждого релиза должен быть APK `Tube-X.Y.apk` и тег `vX.Y`.** До 0.4 проверка всегда падала: заголовок `Accept` ставился после `responseCode` («Already connected»).
+`UpdateChecker` узнаёт версию по очереди: API GitHub → API через `gh-proxy.com` → редирект `github.com/…/releases/latest` → `/tag/vX.Y` напрямую и через `ghfast.top`/`ghproxy.net`. APK качается с GitHub, затем через зеркала `ghfast.top`, `gh-proxy.com`, `gh-proxy.org`, `ghproxy.net` (проверены в ноябре 2026). Каждый скачанный файл проверяется: размер, SHA-256 из поля `digest` API, имя пакета, версия новее и та же подпись, что у установленного приложения — подмена зеркалом до установщика не дойдёт. Сравнивает `tag_name` с `versionName`, качает первый `.apk` из ассетов в `cacheDir/updates` и открывает системный установщик через FileProvider (`${applicationId}.files`). **Значит, у каждого релиза должен быть APK `Tube-X.Y.apk` и тег `vX.Y`.** До 0.4 проверка всегда падала: заголовок `Accept` ставился после `responseCode` («Already connected»).
 
 ## Сборка на сервере разработки
 
@@ -96,6 +99,10 @@ Release подписан debug-ключом общего тулчейна (`.too
 - `-S` (md5sig) может не работать на ядрах Android — такие стратегии просто не проходят тест.
 - С ноября 2026 у ТТК, Ростелекома, Дом.ру тормозят видео вне кэша GGC провайдера — это не DPI, стратегии не помогут.
 - Android 13+ для APK не из магазина: прежде чем включать службу спецвозможностей, нужно «Сведения о приложении → ⋮ → Разрешить ограниченные настройки».
+- **Горизонтальный вид и планшеты:** главный экран при ширине > высоты и ≥ 560dp — кнопка слева, карточки справа; на узких — колонка до 560dp. Отступы — `WindowInsets.safeDrawing` (вырез камеры сбоку). Листы (`GlassSheet`) не шире 640dp. Скриншоты: `home_landscape_phone`, `home_tablet_land`, `sheet_strategy_tablet`, `sheet_settings_landscape`.
+- **Стратегии с `-A`:** запасная группа должна делать настоящий обход. Пустая (как была в OOB TIMEOUT до 0.5) после первого сбоя запоминает IP «без обхода» навсегда (cache-ttl по умолчанию 0). Последняя группа без `-K`/`-H`/детекта нужна для прочего трафика (BEELINE до 0.5 его отбрасывал).
+- **`-Y` и `-S`** на ядрах, где запрещены SO_ATTACH_FILTER/TCP_MD5SIG, обрывают соединение — такие стратегии просто не проходят подбор.
+- Release подписан debug-ключом тулчейна: смена ключа сломает обновление у всех пользователей. Ключ хранить, наружу не отдавать.
 - Предпочтения владельца по интерфейсу: почти весь текст по центру, коротко, без мелкого шрифта (`labelSmall` не использовать для пояснений), главный экран без прокрутки.
 
 ## История версий
@@ -103,4 +110,5 @@ Release подписан debug-ключом общего тулчейна (`.too
 - **0.1** — VPN + byedpi + hev, автозапуск, подбор, DoH для byedpi, ~80 стратегий.
 - **0.2** — результаты по сетям, сортировка, сторож, обновления из GitHub, вёрстка по центру.
 - **0.3** — проверка ClientHello «как у Chrome» и настоящего видеоузла (стратегии больше не помечаются рабочими зря), главный экран без прокрутки, настройки по центру без выхода за края.
+- **0.5** — зеркала обновлений с проверкой SHA-256 и подписи, горизонтальный вид и планшеты, +22 стратегии (`-Qo` копия ClientHello, настоящий hostfakesplit, TTL-лестницы, детект «заморозки 16 КБ» `-W`, STUN/нулевые фейки, группы по доменам YouTube), исправлены OOB TIMEOUT/BEELINE/HOSTFAKE, гонки сервиса VPN, утечки процессов при отмене, двойной подбор, атомарная запись результатов, DNS-пулы и SERVFAIL, `@fake/` path traversal, плавность (анимация кнопки и список стратегий без лишних перерисовок).
 - **0.4** — ClientHello с перестановкой расширений (3 варианта на узел) и проверка API youtubei, второй круг проверки, сторож проверяет через 15 с и помечает провал в VPN, случайные свободные порты, быстрый DNS (keep-alive, устаревший кэш, prefetch), исправлена проверка обновлений + запасной путь через github.com.

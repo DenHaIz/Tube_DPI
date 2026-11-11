@@ -20,6 +20,8 @@ import com.tube.dpi.vpn.TunnelState
 import com.tube.dpi.vpn.VpnController
 import com.tube.ui.i18n.AppLanguage
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -91,9 +93,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** При каждом возвращении на экран: службу могли включить в настройках, приложения — поставить или удалить. */
+    private var packagesSeq = 0
+
     fun refresh() {
         _autostartEnabled.value = AutoStartService.isEnabled(context)
         container.network.refresh()
+        // Перебор всех приложений дорогой: повторяем, только если с прошлого раза что-то ставили или удаляли.
+        val pm = context.packageManager
+        if (_installed.value != null && pm.getChangedPackages(packagesSeq) == null) return
+        packagesSeq = pm.getChangedPackages(0)?.sequenceNumber ?: packagesSeq
         viewModelScope.launch {
             val (defaults, apps) = withContext(Dispatchers.IO) { TargetApps.defaultTargets(context) to TargetApps.installed(context) }
             _defaults.value = defaults
@@ -149,10 +157,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         return null
     }
 
+    private var restartJob: Job? = null
+
     fun setTarget(packageName: String, selected: Boolean) = viewModelScope.launch {
-        val next = if (selected) targets.value + packageName else targets.value - packageName
-        settings.setTargets(next)
-        VpnController.restartIfRunning(context)
+        settings.updateTargets(_defaults.value) { if (selected) it + packageName else it - packageName }
+        // Несколько галочек подряд — один перезапуск туннеля.
+        restartJob?.cancel()
+        restartJob = viewModelScope.launch {
+            delay(RESTART_DEBOUNCE_MS)
+            VpnController.restartIfRunning(context)
+        }
     }
 
     fun setBlockQuic(enabled: Boolean) = viewModelScope.launch {
@@ -181,4 +195,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun cancelTest() = container.autoPick.cancel()
+
+    private companion object {
+        const val RESTART_DEBOUNCE_MS = 800L
+    }
 }

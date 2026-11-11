@@ -1,11 +1,14 @@
 package com.tube.byedpi
 
 import android.content.Context
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.flowOn
@@ -105,13 +108,18 @@ class StrategyTester(
         var lastError: Exception? = null
         var proxy: ByeDpiProcess? = null
         for (attempt in 0 until START_ATTEMPTS) {
+            // Запуск не прерывается отменой: иначе процесс, созданный в момент отмены, остался бы без stop().
             proxy = try {
-                withContext(Dispatchers.IO) { ByeDpiProcess.start(context, ByeDpiProcess.freePort(), argv, blockUdp, fakeSni) }
+                withContext(Dispatchers.IO + NonCancellable) { ByeDpiProcess.start(context, ByeDpiProcess.freePort(), argv, blockUdp, fakeSni) }
             } catch (e: Exception) {
                 lastError = e
                 null
             }
             if (proxy != null) break
+        }
+        if (proxy != null && !coroutineContext.isActive) {
+            withContext(NonCancellable + Dispatchers.IO) { proxy.stop() }
+            coroutineContext.ensureActive()
         }
         if (proxy == null) return StrategyScore(strategy, emptyList(), lastError?.message ?: "start failed")
         val port = proxy.port
@@ -121,7 +129,7 @@ class StrategyTester(
             }
             return StrategyScore(strategy, results)
         } finally {
-            proxy.stop()
+            withContext(NonCancellable + Dispatchers.IO) { proxy.stop() }
         }
     }
 
@@ -153,6 +161,8 @@ class StrategyTester(
             }
             val ok = bytes >= target
             ProbeResult(probe, ok, (System.nanoTime() - started) / 1_000_000, bytes, if (ok) null else "short read $bytes")
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             ProbeResult(probe, false, (System.nanoTime() - started) / 1_000_000, 0, e.javaClass.simpleName + (e.message?.let { ": $it" } ?: ""))
         }

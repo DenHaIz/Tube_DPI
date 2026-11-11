@@ -35,7 +35,8 @@ class StrategyArgsTest {
     fun rejectsReservedAndUnknownOptions() {
         assertEquals(StrategyArgs.Result.Error("-p"), StrategyArgs.parse("-d1 -p 2000"))
         assertEquals(StrategyArgs.Result.Error("--port"), StrategyArgs.parse("--port=1"))
-        assertEquals(StrategyArgs.Result.Error("-X"), StrategyArgs.parse("-X"))
+        assertEquals(StrategyArgs.Result.Error("-G"), StrategyArgs.parse("-G"))
+        assertEquals(StrategyArgs.Result.Error("@fake/../datastore/x"), StrategyArgs.parse("-f-1 -l @fake/../datastore/x"))
         assertEquals(StrategyArgs.Result.Error("-s"), StrategyArgs.parse("-d1 -s"))
         assertEquals(StrategyArgs.Result.Error("junk"), StrategyArgs.parse("junk"))
         assertTrue(StrategyArgs.parse("  ") is StrategyArgs.Result.Error)

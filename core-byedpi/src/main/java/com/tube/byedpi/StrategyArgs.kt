@@ -10,6 +10,7 @@ object StrategyArgs {
     private val options: Map<Char, Pair<String, Boolean>> = mapOf(
         'N' to ("no-domain" to false),
         'U' to ("no-udp" to false),
+        'X' to ("no-ipv6" to false),
         'I' to ("conn-ip" to true),
         'b' to ("buf-size" to true),
         'c' to ("max-conn" to true),
@@ -54,6 +55,8 @@ object StrategyArgs {
     /** Опции, которые задаёт само приложение (адрес и порт прокси) или которые ломают работу в процессе. */
     private val reserved = setOf("ip", "port", "daemon", "pidfile", "transparent", "help", "version", "protect-path", "cache-file", "cache-merge", "connect-to")
 
+    private val FakeFile = Regex("""[A-Za-z0-9_][A-Za-z0-9_.-]*""")
+
     sealed interface Result {
         data class Ok(val argv: List<String>) : Result
         data class Error(val message: String) : Result
@@ -91,6 +94,8 @@ object StrategyArgs {
     fun parse(line: String): Result {
         val tokens = tokenize(line)
         if (tokens.isEmpty()) return Result.Error("empty")
+        // Встроенные фейки — только по имени файла: «@fake/../…» отдал бы в сеть файлы приложения.
+        tokens.firstOrNull { "@fake/" in it && !FakeFile.matches(it.substringAfter("@fake/")) }?.let { return Result.Error(it) }
         var i = 0
         while (i < tokens.size) {
             val token = tokens[i]

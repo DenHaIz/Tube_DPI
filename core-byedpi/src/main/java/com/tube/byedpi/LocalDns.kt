@@ -5,8 +5,12 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.URL
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Executors
+import java.util.concurrent.ExecutorCompletionService
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import javax.net.ssl.HttpsURLConnection
 import kotlin.concurrent.thread
 
@@ -23,11 +27,16 @@ class LocalDns private constructor(private val socket: DatagramSocket) {
     /** Значение переменной окружения TUBE_DNS для byedpi. */
     val address: String get() = "127.0.0.1:$port"
 
-    private val workers = Executors.newFixedThreadPool(8) { r -> Thread(r, "tube-dns").apply { isDaemon = true } }
+    /** Запросы byedpi — отдельно от фоновых обновлений, чтобы не стоять за ними в очереди. Очереди ограничены. */
+    private val live = boundedPool(8, "tube-dns")
+    private val background = boundedPool(3, "tube-dns-bg")
+    private val upstream = boundedPool(8, "tube-dns-up")
+
     private class Entry(val freshUntil: Long, val staleUntil: Long, val body: ByteArray)
 
     private val cache = ConcurrentHashMap<String, Entry>()
-    private val refreshing = ConcurrentHashMap.newKeySet<String>()
+    /** Одинаковые запросы, которые уже идут, не дублируются. */
+    private val inflight = ConcurrentHashMap<String, CompletableFuture<ByteArray?>>()
     @Volatile private var preferred = 0
 
     init {
@@ -38,8 +47,9 @@ class LocalDns private constructor(private val socket: DatagramSocket) {
                 runCatching { socket.receive(packet) }.onFailure { if (socket.isClosed) return@thread }
                 val query = packet.data.copyOfRange(packet.offset, packet.offset + packet.length)
                 val from = packet.socketAddress
-                workers.execute {
-                    val response = runCatching { resolve(query) }.getOrNull() ?: return@execute
+                live.execute {
+                    // Не смогли узнать адрес — отвечаем SERVFAIL сразу, а не заставляем byedpi ждать таймаут.
+                    val response = runCatching { resolve(query) }.getOrNull() ?: servFail(query) ?: return@execute
                     runCatching { socket.send(DatagramPacket(response, response.size, from)) }
                 }
             }
@@ -63,7 +73,7 @@ class LocalDns private constructor(private val socket: DatagramSocket) {
                 refreshLater(key, query)
                 entry.body
             }
-            else -> fetchAndStore(key, query)
+            else -> runCatching { fetchShared(key, query).get(ANSWER_WAIT_MS, TimeUnit.MILLISECONDS) }.getOrNull()
         } ?: return null
         return body.copyOf().also {
             it[0] = query[0]
@@ -81,14 +91,23 @@ class LocalDns private constructor(private val socket: DatagramSocket) {
     }
 
     private fun refreshLater(key: String, query: ByteArray) {
-        if (!refreshing.add(key)) return
-        workers.execute {
-            try {
-                fetchAndStore(key, query)
-            } finally {
-                refreshing.remove(key)
-            }
+        if (inflight.containsKey(key)) return
+        runCatching { background.execute { runCatching { fetchShared(key, query).get() } } }
+    }
+
+    private fun fetchShared(key: String, query: ByteArray): CompletableFuture<ByteArray?> {
+        inflight[key]?.let { return it }
+        val future = CompletableFuture<ByteArray?>()
+        val existing = inflight.putIfAbsent(key, future)
+        if (existing != null) return existing
+        try {
+            future.complete(fetchAndStore(key, query))
+        } catch (e: Exception) {
+            future.complete(null)
+        } finally {
+            inflight.remove(key)
         }
+        return future
     }
 
     private fun fetchAndStore(key: String, query: ByteArray): ByteArray? =
@@ -96,21 +115,48 @@ class LocalDns private constructor(private val socket: DatagramSocket) {
             // Кэшируем только успешные ответы (RCODE = 0).
             if (response.size >= 12 && response[3].toInt() and 0x0F == 0) {
                 val now = System.currentTimeMillis()
+                if (cache.size >= MAX_CACHE) trimCache(now)
                 cache[key] = Entry(now + FRESH_MS, now + STALE_MS, response)
             }
         }
 
+    /** Кэш не растёт бесконечно: сначала выбрасываем просроченное, затем самое старое. */
+    private fun trimCache(now: Long) {
+        cache.entries.removeIf { it.value.staleUntil <= now }
+        if (cache.size < MAX_CACHE) return
+        cache.entries.sortedBy { it.value.freshUntil }.take(cache.size - MAX_CACHE * 3 / 4).forEach { cache.remove(it.key) }
+    }
+
+    /**
+     * Сначала сервер, который отвечал в прошлый раз; не ответил за [FIRST_TRY_MS] — остальные параллельно,
+     * берём первый ответ. Так запрос не ждёт последовательно таймауты всех четырёх серверов.
+     */
     private fun fetch(query: ByteArray): ByteArray? {
-        val start = preferred
-        for (i in Upstreams.indices) {
-            val index = (start + i) % Upstreams.size
-            val response = runCatching { post(Upstreams[index], query) }.getOrNull()
-            if (response != null) {
-                preferred = index
-                return response
-            }
+        val first = preferred
+        val service = ExecutorCompletionService<Pair<Int, ByteArray>>(upstream)
+        val started = System.currentTimeMillis()
+        var pending = 0
+        fun ask(index: Int) {
+            runCatching { service.submit { index to post(Upstreams[index], query) } }.onSuccess { pending++ }
         }
-        return null
+        ask(first)
+        var hedged = false
+        while (true) {
+            val now = System.currentTimeMillis()
+            if (!hedged && (pending == 0 || now - started >= FIRST_TRY_MS)) {
+                // Медленный основной сервер не отменяем — вдруг он ответит первым.
+                Upstreams.indices.filter { it != first }.forEach(::ask)
+                hedged = true
+            }
+            if (pending == 0) return null
+            val wait = if (hedged) started + FIRST_TRY_MS + TIMEOUT_MS - now else started + FIRST_TRY_MS - now
+            if (wait <= 0) return null
+            val done = service.poll(wait, TimeUnit.MILLISECONDS) ?: if (hedged) return null else continue
+            pending--
+            val (index, answer) = runCatching { done.get() }.getOrNull() ?: continue
+            preferred = index
+            return answer
+        }
     }
 
     private fun post(url: String, query: ByteArray): ByteArray {
@@ -143,7 +189,27 @@ class LocalDns private constructor(private val socket: DatagramSocket) {
             "https://8.8.4.4/dns-query",
             "https://1.0.0.1/dns-query",
         )
-        private const val TIMEOUT_MS = 3500
+        private const val TIMEOUT_MS = 3000
+        private const val FIRST_TRY_MS = 1200L
+        /** Чуть меньше, чем ждёт tube_dns.c: ответ (или SERVFAIL) успевает дойти до byedpi. */
+        private const val ANSWER_WAIT_MS = 4500L
+        private const val MAX_CACHE = 2048
+
+        private fun boundedPool(threads: Int, name: String) = ThreadPoolExecutor(
+            threads, threads, 30, TimeUnit.SECONDS, ArrayBlockingQueue(256),
+            { r -> Thread(r, name).apply { isDaemon = true } },
+            ThreadPoolExecutor.DiscardPolicy(),
+        ).apply { allowCoreThreadTimeOut(true) }
+
+        /** Ответ «сервер не смог» на запрос [query]; null — запрос не похож на DNS. */
+        internal fun servFail(query: ByteArray): ByteArray? {
+            if (query.size < 12) return null
+            return query.copyOf().also {
+                it[2] = (it[2].toInt() or 0x80).toByte() // QR = ответ
+                it[3] = ((it[3].toInt() and 0xF0) or 0x80 or 2).toByte() // RA, RCODE = SERVFAIL
+                for (i in 6 until 12) it[i] = 0 // ни ответов, ни дополнительных записей
+            }
+        }
         private const val FRESH_MS = 10 * 60_000L
         private const val STALE_MS = 24 * 60 * 60_000L
 

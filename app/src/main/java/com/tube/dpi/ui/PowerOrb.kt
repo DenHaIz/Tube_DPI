@@ -11,7 +11,6 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
@@ -44,9 +43,10 @@ enum class OrbState { Off, Starting, On, Failed }
 fun PowerOrb(state: OrbState, label: String, onClick: () -> Unit, modifier: Modifier = Modifier, diameter: Dp = 236.dp) {
     val colors = TubeTheme.colors
     val on = state == OrbState.On
-    val glow by animateFloatAsState(if (on) 1f else 0f, Motion.soft(), label = "glow")
-    val ring by animateFloatAsState(if (on) 1f else 0f, Motion.soft(), label = "ring")
-    val tint by animateColorAsState(
+    // Анимированные значения читаются только при рисовании: кадры анимации не пересобирают экран.
+    val glowState = animateFloatAsState(if (on) 1f else 0f, Motion.soft(), label = "glow")
+    val ringState = animateFloatAsState(if (on) 1f else 0f, Motion.soft(), label = "ring")
+    val tintState = animateColorAsState(
         when (state) {
             OrbState.On, OrbState.Starting -> colors.accent
             OrbState.Failed -> colors.danger
@@ -55,13 +55,13 @@ fun PowerOrb(state: OrbState, label: String, onClick: () -> Unit, modifier: Modi
         Motion.snappy(),
         label = "tint",
     )
-    val spin = if (state == OrbState.Starting) {
+    val spinState = if (state == OrbState.Starting) {
         rememberInfiniteTransition(label = "spin").animateFloat(
             initialValue = 0f,
             targetValue = 360f,
             animationSpec = infiniteRepeatable(tween(1100, easing = LinearEasing)),
             label = "angle",
-        ).value
+        )
     } else {
         null
     }
@@ -71,6 +71,7 @@ fun PowerOrb(state: OrbState, label: String, onClick: () -> Unit, modifier: Modi
         modifier
             .size(diameter)
             .drawBehind {
+                val glow = glowState.value
                 if (glow > 0.01f) {
                     drawCircle(
                         Brush.radialGradient(
@@ -91,6 +92,9 @@ fun PowerOrb(state: OrbState, label: String, onClick: () -> Unit, modifier: Modi
                 .liquidGlass(Shapes.Pill)
                 .drawWithContent {
                     drawContent()
+                    val tint = tintState.value
+                    val ring = ringState.value
+                    val spin = spinState?.value
                     val stroke = (diameter * 0.03f).toPx()
                     val inset = (diameter * 0.06f).toPx()
                     val arcSize = Size(size.width - inset * 2, size.height - inset * 2)
@@ -106,11 +110,11 @@ fun PowerOrb(state: OrbState, label: String, onClick: () -> Unit, modifier: Modi
             Icon(
                 TubeIcons.Power,
                 contentDescription = null,
-                tint = tint,
+                tint = tintState.value,
                 modifier = Modifier
                     .size(diameter * 0.29f)
                     .graphicsLayer {
-                        val s = 1f + 0.06f * glow
+                        val s = 1f + 0.06f * glowState.value
                         scaleX = s
                         scaleY = s
                     },

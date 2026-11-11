@@ -25,7 +25,12 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -57,6 +62,7 @@ import kotlinx.coroutines.launch
 /** Сворачивание листа: около 0,4 с — немного короче раскрытия, с разгоном к концу. */
 private const val SheetExitMs = 400
 private val SheetExitEasing = CubicBezierEasing(0.35f, 0f, 0.65f, 1f)
+private val MaxSheetWidth = 640.dp
 
 /**
  * Стеклянный лист поверх экрана. Появляется, «вырастая» снизу,
@@ -150,7 +156,8 @@ fun GlassSheet(
         BoxWithConstraints(
             Modifier
                 .fillMaxSize()
-                .statusBarsPadding()
+                // Сверху и по бокам — вырез камеры и системные панели (в горизонтальном виде они сбоку).
+                .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))
                 .imePadding(),
             contentAlignment = Alignment.BottomCenter,
         ) {
@@ -168,6 +175,8 @@ fun GlassSheet(
                         transformOrigin = TransformOrigin(0.5f, 1f)
                     }
                     .heightIn(max = maxSheetHeight)
+                    // На планшете и в горизонтальном виде лист не растягивается во всю ширину.
+                    .widthIn(max = MaxSheetWidth)
                     .fillMaxWidth()
                     .liquidGlass(Shapes.Sheet, tint = colors.background.copy(alpha = if (colors.isDark) 0.74f else 0.66f))
                     .then(

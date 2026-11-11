@@ -108,6 +108,10 @@ class SettingsRepository(private val context: Context) {
 
     suspend fun setTargets(packages: Set<String>) = edit { it[targetsKey] = packages }
 
+    /** Добавить или убрать приложение одной транзакцией: быстрые нажатия подряд не теряются. */
+    suspend fun updateTargets(defaults: Set<String>, transform: (Set<String>) -> Set<String>) =
+        edit { it[targetsKey] = transform(it[targetsKey] ?: defaults) }
+
     suspend fun setBlockQuic(enabled: Boolean) = edit { it[blockQuicKey] = enabled }
 
     suspend fun setStopDelayMinutes(minutes: Int) = edit { it[stopDelayKey] = minutes }

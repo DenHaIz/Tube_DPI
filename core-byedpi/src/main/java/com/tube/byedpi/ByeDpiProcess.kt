@@ -93,6 +93,7 @@ class ByeDpiProcess private constructor(
 
         /** Префикс встроенных фейковых пакетов в аргументах: `-l @fake/tls_clienthello_www_google_com.bin`. */
         const val FAKE_PREFIX = "@fake/"
+        private val FakeName = Regex("""[A-Za-z0-9_][A-Za-z0-9_.-]*""")
 
         /**
          * Подставляет вместо `@fake/<имя>` путь к файлу из assets/fake (фейковые ClientHello/QUIC из zapret):
@@ -102,11 +103,19 @@ class ByeDpiProcess private constructor(
             val at = arg.indexOf(FAKE_PREFIX)
             if (at < 0) return@map arg
             val name = arg.substring(at + FAKE_PREFIX.length)
-            val file = File(context.filesDir, "fake/$name")
+            // Только имя файла из assets/fake: «../» в своей стратегии не должен отдавать в сеть файлы приложения.
+            require(FakeName.matches(name)) { "bad fake file: $name" }
+            // Папка по версии приложения: после обновления фейки берутся заново, а не из старой копии.
+            val version = runCatching { context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime }.getOrDefault(0L)
+            val file = File(context.filesDir, "fake/$version/$name")
             synchronized(ByeDpiProcess) {
                 if (!file.exists()) {
+                    File(context.filesDir, "fake").listFiles()?.filter { it.name != version.toString() }?.forEach { it.deleteRecursively() }
                     file.parentFile?.mkdirs()
-                    context.assets.open("fake/$name").use { input -> file.outputStream().use { input.copyTo(it) } }
+                    // Через временный файл: если процесс убьют посреди копирования, обрезанный файл не останется.
+                    val tmp = File(file.parentFile, "$name.tmp")
+                    context.assets.open("fake/$name").use { input -> tmp.outputStream().use { input.copyTo(it) } }
+                    if (!tmp.renameTo(file)) error("cannot save $name")
                 }
             }
             arg.substring(0, at) + file.absolutePath

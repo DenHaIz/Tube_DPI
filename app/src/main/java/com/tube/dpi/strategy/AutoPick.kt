@@ -20,10 +20,12 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** Ход подбора (общий для экрана и сторожа). */
 data class TestProgress(
@@ -51,22 +53,40 @@ class AutoPick(
     /** Строки журнала последнего подбора: итог по каждому узлу. */
     val log = MutableStateFlow<List<String>>(emptyList())
 
-    private var job: Job? = null
+    /** Идущий подбор — запущенный кнопкой или сторожем; «Стоп» отменяет любой. */
+    @Volatile private var active: Job? = null
 
-    val running: Boolean get() = _progress.value.running
+    /** Занят с момента вызова, а не с первой проверки: двойное нажатие не запускает два подбора. */
+    private val busy = AtomicBoolean(false)
+
+    val running: Boolean get() = busy.get()
 
     fun start(background: Boolean = false): Job? {
-        if (running) return job
-        return scope.launch { runFull(background) }.also { job = it }
+        if (running) return active
+        return scope.launch { runFull(background) }
     }
 
     fun cancel() {
-        job?.cancel()
-        _progress.value = _progress.value.copy(running = false)
+        active?.cancel()
     }
 
-    /** Полный перебор: все встроенные, набор ByeByeDPI и своя стратегия. Возвращает рейтинг. */
+    /**
+     * Полный перебор: все встроенные, набор ByeByeDPI и своя стратегия. Возвращает рейтинг;
+     * пустой, если подбор уже идёт (одновременно два подбора гоняли бы по 12 процессов и путали результаты).
+     */
     suspend fun runFull(background: Boolean = false): List<StrategyScore> {
+        if (!busy.compareAndSet(false, true)) return emptyList()
+        active = currentCoroutineContext()[Job]
+        try {
+            return runExclusive(background)
+        } finally {
+            active = null
+            busy.set(false)
+            _progress.value = _progress.value.copy(running = false)
+        }
+    }
+
+    private suspend fun runExclusive(background: Boolean): List<StrategyScore> {
         network.refresh()
         val key = network.current.value?.key ?: return emptyList()
         val custom = settings.customArgs.first().takeIf { it.isNotBlank() }

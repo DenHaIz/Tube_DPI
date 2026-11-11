@@ -76,7 +76,8 @@ static int query(const char *server, const char *name, int type, struct sockaddr
         return -1;
 
     uint8_t msg[512];
-    uint16_t id = (uint16_t)(rand() & 0xFFFF);
+    /* arc4random: непредсказуемый id (rand() без seed одинаков во всех процессах byedpi). */
+    uint16_t id = (uint16_t)(arc4random() & 0xFFFF);
     memset(msg, 0, 12);
     msg[0] = id >> 8;
     msg[1] = id & 0xFF;
@@ -94,14 +95,35 @@ static int query(const char *server, const char *name, int type, struct sockaddr
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0)
         return -1;
-    struct timeval tv = { .tv_sec = 4, .tv_usec = 0 };
+    /* connect(): ядро отбрасывает датаграммы не от нашего DNS — чужое локальное приложение не подсунет ответ. */
+    if (connect(fd, (struct sockaddr *)&srv, sizeof(srv)) < 0) {
+        close(fd);
+        return -1;
+    }
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 500000 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+    /* Две попытки по 2,5 с: LocalDns отвечает за ~4,5 с даже при недоступных DoH (в худшем случае — SERVFAIL). */
+    uint8_t resp[1500];
+    int len = -1;
+    for (int attempt = 0; attempt < 2 && len < 0; attempt++) {
+        if (send(fd, msg, qlen, 0) != qlen)
+            break;
+        for (;;) {
+            int r = (int)recv(fd, resp, sizeof(resp), 0);
+            if (r < 0)
+                break;
+            /* Только ответ (QR) на наш запрос (id). */
+            if (r >= 12 && resp[0] == msg[0] && resp[1] == msg[1] && (resp[2] & 0x80)) {
+                len = r;
+                break;
+            }
+        }
+    }
+
     int result = -1;
-    if (sendto(fd, msg, qlen, 0, (struct sockaddr *)&srv, sizeof(srv)) == qlen) {
-        uint8_t resp[1500];
-        int len = (int)recv(fd, resp, sizeof(resp), 0);
-        if (len >= 12 && resp[0] == msg[0] && resp[1] == msg[1] && (resp[3] & 0x0F) == 0) {
+    {
+        if (len >= 12 && (resp[3] & 0x0F) == 0) {
             int qd = (resp[4] << 8) | resp[5];
             int an = (resp[6] << 8) | resp[7];
             int pos = 12;

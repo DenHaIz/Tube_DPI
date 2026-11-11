@@ -6,6 +6,7 @@ import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.util.Log
 import androidx.core.app.ServiceCompat
 import com.tube.byedpi.ByeDpiProcess
 import com.tube.byedpi.LocalDns
@@ -15,9 +16,12 @@ import com.tube.dpi.apps.TargetApps
 import com.tube.dpi.strategy.StrategyWatchdog
 import com.tube.tunnel.TProxyService
 import com.tube.tunnel.TunnelConfig
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -26,11 +30,15 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.File
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Локальный VPN только для выбранных приложений:
  * приложение → TUN → hev-socks5-tunnel → SOCKS5 127.0.0.1 → byedpi (desync) → интернет.
  * Сам Tube в туннель не входит, поэтому соединения byedpi идут напрямую, без protect().
+ *
+ * Все изменения состояния — под [lock]. Сервис останавливается только по последней команде ([lastStartId]):
+ * быстрые «выключить → включить» (плитка, автозапуск) не убивают только что запущенный туннель.
  */
 class TubeVpnService : VpnService() {
 
@@ -41,29 +49,39 @@ class TubeVpnService : VpnService() {
         const val EXTRA_BY_AUTOSTART = "by_autostart"
 
         private const val MONITOR_INTERVAL_MS = 1000L
+        private const val TAG = "TubeVpn"
     }
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    /** Непойманная ошибка в фоне не роняет процесс (а с ним и туннель), а показывается как сбой. */
+    private val errors = CoroutineExceptionHandler { _, e ->
+        Log.e(TAG, "unexpected", e)
+        TunnelState.set(TunnelStatus.Failed(FailReason.TunnelFailed, e.message ?: e.javaClass.simpleName))
+    }
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + errors)
     private val lock = Mutex()
-    private var proxy: ByeDpiProcess? = null
-    private var tun: ParcelFileDescriptor? = null
+    private val lastStartId = AtomicInteger(0)
+
+    @Volatile private var proxy: ByeDpiProcess? = null
+    @Volatile private var tun: ParcelFileDescriptor? = null
     private var monitor: Job? = null
     private var watchdog: Job? = null
 
     private val container get() = (application as TubeApp).container
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        lastStartId.set(startId)
         val byAutostart = intent?.getBooleanExtra(EXTRA_BY_AUTOSTART, false) ?: false
         when (intent?.action) {
-            ACTION_STOP -> scope.launch { lock.withLock { shutdown(TunnelStatus.Stopped) } }
+            ACTION_STOP -> scope.launch { lock.withLock { shutdown(TunnelStatus.Stopped, startId) } }
             ACTION_RESTART -> {
                 promoteToForeground("…", 0)
-                scope.launch { lock.withLock { teardown(); startTunnel(byAutostart) } }
+                // Новый туннель поднимается до закрытия старого: в промежутке трафик YouTube не уходит мимо VPN.
+                scope.launch { lock.withLock { guardedStart(byAutostart, startId, replace = true) } }
             }
             // null — система перезапустила сервис (always-on VPN или после нехватки памяти).
             else -> {
                 promoteToForeground("…", 0)
-                scope.launch { lock.withLock { if (proxy == null) startTunnel(byAutostart) } }
+                scope.launch { lock.withLock { if (proxy == null) guardedStart(byAutostart, startId, replace = false) } }
             }
         }
         return START_NOT_STICKY
@@ -72,34 +90,60 @@ class TubeVpnService : VpnService() {
     /** Android требует startForeground в первые секунды после startForegroundService. */
     private fun promoteToForeground(strategyName: String, apps: Int) {
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0
-        ServiceCompat.startForeground(this, Notifications.ID_TUNNEL, Notifications.tunnel(this, strategyName, apps), type)
+        runCatching { ServiceCompat.startForeground(this, Notifications.ID_TUNNEL, Notifications.tunnel(this, strategyName, apps), type) }
+            .onFailure { Log.w(TAG, "startForeground", it) }
     }
 
-    private suspend fun startTunnel(byAutostart: Boolean) {
-        TunnelState.set(TunnelStatus.Starting)
+    /** Любая ошибка запуска — понятный сбой, а не падение; отмена (сервис уничтожен) — без висящего «Запуск…». */
+    private suspend fun guardedStart(byAutostart: Boolean, startId: Int, replace: Boolean) {
+        try {
+            startTunnel(byAutostart, startId, replace)
+        } catch (e: CancellationException) {
+            teardown()
+            if (TunnelState.isActive) TunnelState.set(TunnelStatus.Stopped)
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "start", e)
+            fail(FailReason.TunnelFailed, e.message ?: e.javaClass.simpleName, startId)
+        }
+    }
+
+    private suspend fun startTunnel(byAutostart: Boolean, startId: Int, replace: Boolean) {
+        if (!replace || proxy == null) TunnelState.set(TunnelStatus.Starting)
         // В знакомой сети — стратегия, которая там работала (выбрана вручную или сторожем).
         container.network.refresh()
-        container.results.of(container.network.current.value?.key)?.chosen?.let { chosen ->
+        val networkKey = container.network.current.value?.key
+        container.results.of(networkKey)?.chosen?.let { chosen ->
             if (container.resolveStrategy(chosen) != null) container.settings.setStrategy(chosen)
         }
         val settings = container.settings.tunnelSettings { TargetApps.defaultTargets(this) }
         val installed = settings.targets.filter { TargetApps.isInstalled(this, it) }
-        if (installed.isEmpty()) return fail(FailReason.NoApps, null)
+        if (installed.isEmpty()) return fail(FailReason.NoApps, null, startId)
 
         val argv = when (val parsed = StrategyArgs.parse(settings.strategy.args)) {
             is StrategyArgs.Result.Ok -> parsed.argv
-            is StrategyArgs.Result.Error -> return fail(FailReason.ProxyFailed, parsed.message)
+            is StrategyArgs.Result.Error -> return fail(FailReason.ProxyFailed, parsed.message, startId)
         }
         // Адреса YouTube — заранее: byedpi резолвит имена в своём единственном потоке и не должен ждать DoH.
-        val videoHost = container.results.of(container.network.current.value?.key)?.videoHost
+        val videoHost = container.results.of(networkKey)?.videoHost
         LocalDns.shared().prefetch(LocalDns.YouTubeHosts + LocalDns.videoCluster(videoHost))
-        // Порт каждый раз свободный: старый byedpi после перезапуска мог ещё не отпустить прежний.
+
+        // Старый туннель (при перезапуске) живёт, пока не готов новый.
+        val oldProxy = proxy
+        val oldTun = tun
+        stopJobs()
+
+        // Порт каждый раз свободный: старый byedpi ещё слушает свой.
         val port = ByeDpiProcess.freePort()
-        proxy = try {
+        val newProxy = try {
             ByeDpiProcess.start(this, port, argv, blockUdp = settings.blockQuic, fakeSni = settings.fakeSni)
         } catch (e: Exception) {
-            return fail(FailReason.ProxyFailed, e.message)
+            return fail(FailReason.ProxyFailed, e.message, startId)
         }
+        proxy = newProxy
+        // Если сервис уничтожат дальше, teardown остановит и новый прокси, и старый.
+        oldProxy?.let { retired += it }
+        oldTun?.let { retiredTuns += it }
 
         val builder = Builder()
             .setSession("Tube")
@@ -126,24 +170,27 @@ class TubeVpnService : VpnService() {
             } catch (_: PackageManager.NameNotFoundException) {
             }
         }
-        if (allowed == 0) return fail(FailReason.NoApps, null)
+        if (allowed == 0) return fail(FailReason.NoApps, null, startId)
 
         val fd = try {
             builder.establish()
         } catch (e: Exception) {
-            return fail(FailReason.TunnelFailed, e.message)
-        } ?: return fail(FailReason.NoConsent, null)
+            return fail(FailReason.TunnelFailed, e.message, startId)
+        } ?: return fail(FailReason.NoConsent, null, startId)
+        // Система уже переключила маршруты на новый интерфейс; старый можно закрывать.
+        runCatching { TProxyService.TProxyStopService() }
         tun = fd
+        closeRetired()
 
         val config = File(cacheDir, "tunnel.yml").apply { writeText(TunnelConfig(socksPort = port).toYaml()) }
         if (!TProxyService.TProxyStartService(config.absolutePath, fd.fd)) {
-            return fail(FailReason.TunnelFailed, "hev-socks5-tunnel")
+            return fail(FailReason.TunnelFailed, "hev-socks5-tunnel", startId)
         }
 
         promoteToForeground(settings.strategy.name, allowed)
         Notifications.cancelAlerts(this)
         TunnelState.set(TunnelStatus.Running(System.currentTimeMillis(), settings.strategy.name, byAutostart))
-        monitor = scope.launch { monitorLoop() }
+        monitor = scope.launch { monitorLoop(newProxy) }
         watchdog = scope.launch {
             StrategyWatchdog(this@TubeVpnService, container, port, settings.strategy.id) { next, reason ->
                 container.chooseStrategy(next.id)
@@ -153,16 +200,30 @@ class TubeVpnService : VpnService() {
         }
     }
 
+    /** Прокси и интерфейсы прошлого запуска: закрываются, когда новый туннель уже работает. */
+    private val retired = mutableListOf<ByeDpiProcess>()
+    private val retiredTuns = mutableListOf<ParcelFileDescriptor>()
+
+    private fun closeRetired() {
+        retiredTuns.forEach { runCatching { it.close() } }
+        retiredTuns.clear()
+        retired.forEach { it.stop() }
+        retired.clear()
+    }
+
     /** Следит, что byedpi жив, и считает трафик для экрана и автозапуска. */
-    private suspend fun monitorLoop() {
+    private suspend fun monitorLoop(current: ByeDpiProcess) {
         var lastRx = 0L
         var lastTx = 0L
         while (scope.isActive) {
             delay(MONITOR_INTERVAL_MS)
-            val current = proxy ?: return
+            if (proxy !== current) return
             TunnelState.setLog(current.logTail())
             if (!current.isAlive) {
-                lock.withLock { fail(FailReason.ProxyFailed, current.logTail().takeLast(3).joinToString("\n")) }
+                lock.withLock {
+                    // Пока ждали замок, туннель могли перезапустить — тогда этот прокси уже не наш.
+                    if (proxy === current) fail(FailReason.ProxyFailed, current.logTail().takeLast(3).joinToString("\n"), lastStartId.get())
+                }
                 return
             }
             val stats = runCatching { TProxyService.TProxyGetStats() }.getOrNull() ?: continue
@@ -174,47 +235,60 @@ class TubeVpnService : VpnService() {
         }
     }
 
-    private fun fail(reason: FailReason, details: String?) {
+    private fun fail(reason: FailReason, details: String?, startId: Int) {
         teardown()
         TunnelState.set(TunnelStatus.Failed(reason, details))
         if (reason != FailReason.NoConsent) Notifications.showFailed(this, listOfNotNull(reason.name, details).joinToString(": "))
         else Notifications.showConsentNeeded(this)
-        stopSelfCompletely()
+        stopIfLatest(startId)
     }
 
-    private fun shutdown(status: TunnelStatus) {
+    private fun shutdown(status: TunnelStatus, startId: Int) {
         teardown()
         TunnelState.set(status)
-        stopSelfCompletely()
+        stopIfLatest(startId)
     }
 
-    private fun teardown() {
+    private fun stopJobs() {
         monitor?.cancel()
         monitor = null
         watchdog?.cancel()
         watchdog = null
+    }
+
+    private fun teardown() {
+        stopJobs()
         runCatching { TProxyService.TProxyStopService() }
         runCatching { tun?.close() }
         tun = null
         proxy?.let { TunnelState.setLog(it.logTail()) }
         proxy?.stop()
         proxy = null
+        closeRetired()
     }
 
-    private fun stopSelfCompletely() {
+    /** Останавливаемся, только если после этой команды не пришла новая (например, «включить» сразу после «выключить»). */
+    private fun stopIfLatest(startId: Int) {
+        if (startId < lastStartId.get()) return
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        stopSelfResult(startId)
     }
 
     /** Другое VPN-приложение заняло место или пользователь отключил VPN в системных настройках. */
     override fun onRevoke() {
-        scope.launch { lock.withLock { shutdown(TunnelStatus.Failed(FailReason.Revoked, null)) } }
+        scope.launch { lock.withLock { shutdown(TunnelStatus.Failed(FailReason.Revoked, null), lastStartId.get()) } }
     }
 
     override fun onDestroy() {
-        teardown()
-        if (TunnelState.isActive) TunnelState.set(TunnelStatus.Stopped)
+        // Запуск, который ещё идёт, отменяется и сам убирает за собой; остальное — под замком в фоне,
+        // чтобы не гоняться с ним и не держать главный поток (остановка byedpi занимает до пары секунд).
         scope.cancel()
+        container.scope.launch(NonCancellable + Dispatchers.IO) {
+            lock.withLock {
+                teardown()
+                if (TunnelState.isActive) TunnelState.set(TunnelStatus.Stopped)
+            }
+        }
         super.onDestroy()
     }
 }

@@ -13,7 +13,11 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONArray
 import org.json.JSONObject
+import android.util.AtomicFile
 import java.io.File
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** Итоги проверок в одной сети: что работает и какую стратегию там использовать. */
 data class NetworkResults(
@@ -30,34 +34,63 @@ data class NetworkResults(
     val working: List<StrategyScore> get() = ranking.filter { it.works }
 }
 
-/** Результаты по сетям в filesDir/results.json — переживают перезапуск. */
+/**
+ * Результаты по сетям в filesDir/results.json — переживают перезапуск.
+ *
+ * Память обновляется сразу, а файл пишется в фоне не чаще раза в [WRITE_DELAY_MS] (подбор присылает
+ * сотню обновлений подряд) и атомарно: если процесс убьют посреди записи, остаётся прошлая целая версия.
+ */
 class ResultsStore(context: Context) {
-    private val file = File(context.filesDir, "results.json")
+    private val file = AtomicFile(File(context.filesDir, "results.json"))
     private val _all = MutableStateFlow(load())
     val all: StateFlow<Map<String, NetworkResults>> = _all.asStateFlow()
+
+    private val writer = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "results-writer").apply { isDaemon = true } }
+    private val writeScheduled = AtomicBoolean(false)
 
     fun of(key: String?): NetworkResults? = key?.let { _all.value[it] }
 
     @Synchronized
     fun update(key: String, transform: (NetworkResults) -> NetworkResults) {
-        val next = _all.value + (key to transform(_all.value[key] ?: NetworkResults()))
-        _all.value = next
-        runCatching { file.writeText(encode(next).toString()) }
+        _all.value = _all.value + (key to transform(_all.value[key] ?: NetworkResults()))
+        if (writeScheduled.compareAndSet(false, true)) {
+            writer.schedule({
+                writeScheduled.set(false)
+                write(_all.value)
+            }, WRITE_DELAY_MS, TimeUnit.MILLISECONDS)
+        }
     }
+
+    /** Записать немедленно (тесты). */
+    fun flush() = write(_all.value)
 
     @Synchronized
     fun clear() {
         _all.value = emptyMap()
-        file.delete()
+        writer.execute { file.delete() }
+    }
+
+    private fun write(all: Map<String, NetworkResults>) {
+        synchronized(file) {
+            var out: java.io.FileOutputStream? = null
+            try {
+                out = file.startWrite()
+                out.write(encode(all).toString().toByteArray())
+                file.finishWrite(out)
+            } catch (_: Exception) {
+                out?.let { file.failWrite(it) }
+            }
+        }
     }
 
     private fun load(): Map<String, NetworkResults> = runCatching {
-        if (!file.exists()) return emptyMap()
-        val root = JSONObject(file.readText())
+        val root = JSONObject(String(file.readFully()))
         root.keys().asSequence().associateWith { decodeNetwork(root.getJSONObject(it)) }
     }.getOrDefault(emptyMap())
 
     companion object {
+        private const val WRITE_DELAY_MS = 1500L
+
         /**
          * Версия методики проверки. Результаты старой методики сбрасываются (выбор стратегии остаётся):
          * в 0.2 не было проверки ClientHello «как у Chrome», и часть стратегий помечалась рабочими зря.
