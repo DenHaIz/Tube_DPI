@@ -1,0 +1,13 @@
+.gradle/
+.kotlin/
+build/
+local.properties
+*.iml
+.idea/
+captures/
+env.ps1
+.claude/
+.cxx/
+tools/pixel.html
+/Tube-*.apk
+.toolchain

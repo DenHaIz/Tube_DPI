@@ -1,0 +1,6 @@
+[submodule "core-byedpi/src/main/cpp/byedpi"]
+	path = core-byedpi/src/main/cpp/byedpi
+	url = https://github.com/hufrea/byedpi.git
+[submodule "core-tunnel/src/main/jni/hev-socks5-tunnel"]
+	path = core-tunnel/src/main/jni/hev-socks5-tunnel
+	url = https://github.com/heiher/hev-socks5-tunnel.git

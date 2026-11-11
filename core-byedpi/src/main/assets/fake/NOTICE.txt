@@ -1,0 +1,2 @@
+Fake TLS ClientHello / QUIC Initial payloads from zapret (https://github.com/bol-van/zapret, files/fake).
+MIT License, Copyright (c) 2016-2026 bol-van.

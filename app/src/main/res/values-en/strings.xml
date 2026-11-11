@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="autostart_service_label">Tube — start with YouTube</string>
+    <string name="autostart_service_description">Tube notices when a selected app (YouTube, ReVanced, Morphe) comes to the screen and turns the unblocking on. The service receives only the name of the opened app — screen content is never read or sent anywhere.</string>
+    <string name="shortcut_youtube_long">YouTube via Tube</string>
+</resources>

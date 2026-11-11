@@ -1,0 +1,3 @@
+APP_OPTIM := release
+APP_CFLAGS := -O3 -DPKGNAME=com/tube/tunnel -DCLSNAME=TProxyService
+APP_SUPPORT_FLEXIBLE_PAGE_SIZES := true

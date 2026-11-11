@@ -1,0 +1,211 @@
+package com.tube.ui.components
+
+import androidx.activity.compose.PredictiveBackHandler
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animate
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.util.VelocityTracker
+import androidx.compose.ui.unit.Velocity
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.dp
+import com.tube.ui.glass.liquidGlass
+import com.tube.ui.theme.Motion
+import com.tube.ui.theme.Shapes
+import com.tube.ui.theme.TubeTheme
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.launch
+
+/** Сворачивание листа: около 0,4 с — немного короче раскрытия, с разгоном к концу. */
+private const val SheetExitMs = 400
+private val SheetExitEasing = CubicBezierEasing(0.35f, 0f, 0.65f, 1f)
+
+/**
+ * Стеклянный лист поверх экрана. Появляется, «вырастая» снизу,
+ * закрывается свайпом вниз, тапом по фону или жестом «назад» с предпросмотром.
+ */
+@Composable
+fun GlassSheet(
+    visible: Boolean,
+    onDismiss: () -> Unit,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    val colors = TubeTheme.colors
+    AnimatedVisibility(visible, enter = fadeIn(Motion.snappy()), exit = fadeOut(tween(SheetExitMs))) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(colors.scrim)
+                // Во время исчезновения фон не перехватывает касания.
+                .then(if (visible) Modifier.clickable(interactionSource = null, indication = null, onClick = onDismiss) else Modifier),
+        )
+    }
+    AnimatedVisibility(
+        visible = visible,
+        modifier = Modifier.fillMaxSize(),
+        enter = slideInVertically(Motion.soft()) { it / 3 } +
+            scaleIn(Motion.soft(), initialScale = 0.82f, transformOrigin = TransformOrigin(0.5f, 1f)) +
+            fadeIn(Motion.snappy()),
+        exit = slideOutVertically(tween(SheetExitMs, easing = SheetExitEasing)) { it } +
+            scaleOut(tween(SheetExitMs, easing = SheetExitEasing), targetScale = 0.9f, transformOrigin = TransformOrigin(0.5f, 1f)) +
+            fadeOut(tween(SheetExitMs - 120, delayMillis = 120)),
+    ) {
+        // Сдвиг листа вниз пальцем; анимация — только при отпускании.
+        var drag by remember { mutableFloatStateOf(0f) }
+        var backProgress by remember { mutableFloatStateOf(0f) }
+        val scope = rememberCoroutineScope()
+        val dismissDistance = with(LocalDensity.current) { 110.dp.toPx() }
+        // Быстрый взмах закрывает лист, только если его действительно потянули, а не дёрнуло раскладкой
+        // (например, когда прячется клавиатура и лист съезжает вниз).
+        val flingDistance = with(LocalDensity.current) { 28.dp.toPx() }
+        val currentDismiss by rememberUpdatedState(onDismiss)
+
+        fun settle(velocity: Float) {
+            if (drag > dismissDistance || (velocity > 1600f && drag > flingDistance)) {
+                currentDismiss()
+            } else {
+                scope.launch { animate(drag, 0f, animationSpec = Motion.bouncy()) { v, _ -> drag = v } }
+            }
+        }
+
+        // Тянуть вниз можно за любое место: пока содержимое не у верха — оно прокручивается,
+        // дальше жест «перетекает» в сдвиг всего листа.
+        val nestedScroll = remember {
+            object : NestedScrollConnection {
+                override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                    if (available.y < 0f && drag > 0f) {
+                        val used = maxOf(available.y, -drag)
+                        drag += used
+                        return Offset(0f, used)
+                    }
+                    return Offset.Zero
+                }
+
+                override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
+                    if (available.y > 0f && source == NestedScrollSource.UserInput) {
+                        drag += available.y
+                        return Offset(0f, available.y)
+                    }
+                    return Offset.Zero
+                }
+
+                override suspend fun onPreFling(available: Velocity): Velocity {
+                    if (drag > 0f) {
+                        settle(available.y)
+                        return available
+                    }
+                    return Velocity.Zero
+                }
+            }
+        }
+
+        PredictiveBackHandler(enabled = visible) { events ->
+            try {
+                events.collect { backProgress = it.progress }
+                onDismiss()
+            } catch (e: CancellationException) {
+                backProgress = 0f
+                throw e
+            }
+        }
+
+        BoxWithConstraints(
+            Modifier
+                .fillMaxSize()
+                .statusBarsPadding()
+                .imePadding(),
+            contentAlignment = Alignment.BottomCenter,
+        ) {
+            val maxSheetHeight = maxHeight - 12.dp
+            Column(
+                Modifier
+                    .padding(horizontal = 8.dp)
+                    .navigationBarsPadding()
+                    .padding(bottom = 8.dp)
+                    .graphicsLayer {
+                        translationY = drag
+                        val s = 1f - backProgress * 0.08f
+                        scaleX = s
+                        scaleY = s
+                        transformOrigin = TransformOrigin(0.5f, 1f)
+                    }
+                    .heightIn(max = maxSheetHeight)
+                    .fillMaxWidth()
+                    .liquidGlass(Shapes.Sheet, tint = colors.background.copy(alpha = if (colors.isDark) 0.74f else 0.66f))
+                    .then(
+                        if (visible) {
+                            Modifier.clickable(interactionSource = null, indication = null) { /* не пропускать тапы к фону */ }
+                        } else {
+                            Modifier
+                        },
+                    )
+                    .nestedScroll(nestedScroll)
+                    // Участки без прокрутки (ручка, заголовок) тоже тянут лист.
+                    .pointerInput(Unit) {
+                        val tracker = VelocityTracker()
+                        detectVerticalDragGestures(
+                            onDragStart = { tracker.resetTracking() },
+                            onDragEnd = { settle(tracker.calculateVelocity().y) },
+                            onDragCancel = { settle(0f) },
+                        ) { change, dy ->
+                            tracker.addPosition(change.uptimeMillis, change.position)
+                            change.consume()
+                            drag = (drag + dy).coerceAtLeast(0f)
+                        }
+                    },
+            ) {
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 10.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Box(
+                        Modifier
+                            .size(width = 40.dp, height = 5.dp)
+                            .background(colors.textTertiary.copy(alpha = 0.5f), RoundedCornerShape(50)),
+                    )
+                }
+                content()
+            }
+        }
+    }
+}

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name" translatable="false">Tube</string>
+    <string name="autostart_service_label">Tube — автозапуск с YouTube</string>
+    <string name="autostart_service_description">Tube узнаёт, когда на экране открывается выбранное приложение (YouTube, ReVanced, Morphe), и включает обход блокировок. Служба получает только имя открытого приложения — содержимое экрана не читается и никуда не передаётся.</string>
+    <string name="tile_label" translatable="false">Tube</string>
+    <string name="shortcut_youtube_short" translatable="false">YouTube</string>
+    <string name="shortcut_youtube_long">YouTube через Tube</string>
+</resources>
