@@ -18,6 +18,7 @@ object Notifications {
     const val ID_TUNNEL = 1
     private const val ID_CONSENT = 2
     private const val ID_FAILED = 3
+    private const val ID_SWITCHED = 4
 
     private fun lang(context: Context): AppLanguage =
         (context.applicationContext as TubeApp).container.language.value ?: AppLanguage.Russian
@@ -87,6 +88,27 @@ object Notifications {
                 .setContentText(message)
                 .setContentIntent(openApp(context))
                 .setAutoCancel(true)
+                .build(),
+        )
+    }
+
+    /** Сторож сменил стратегию — короткое уведомление без звука. */
+    fun showSwitched(context: Context, from: String, to: String, reason: com.tube.dpi.strategy.SwitchReason) {
+        ensureChannels(context)
+        val lang = lang(context)
+        val title = when (reason) {
+            com.tube.dpi.strategy.SwitchReason.Failed -> lang.pick("$from перестала работать", "$from stopped working")
+            com.tube.dpi.strategy.SwitchReason.NetworkChanged -> lang.pick("Другая сеть", "Network changed")
+        }
+        notify(
+            context, ID_SWITCHED,
+            NotificationCompat.Builder(context, CHANNEL_TUNNEL)
+                .setSmallIcon(R.drawable.ic_stat_tube)
+                .setContentTitle(title)
+                .setContentText(lang.pick("Включена стратегия $to", "Switched to $to"))
+                .setContentIntent(openApp(context))
+                .setAutoCancel(true)
+                .setSilent(true)
                 .build(),
         )
     }

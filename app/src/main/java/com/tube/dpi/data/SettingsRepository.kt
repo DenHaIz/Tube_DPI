@@ -38,6 +38,9 @@ class SettingsRepository(private val context: Context) {
     private val stopDelayKey = intPreferencesKey("stop_delay_minutes")
     private val lastClientKey = stringPreferencesKey("last_client")
     private val fakeSniKey = stringPreferencesKey("fake_sni")
+    private val watchdogKey = booleanPreferencesKey("watchdog")
+    private val autoUpdateKey = booleanPreferencesKey("check_updates")
+    private val lastUpdateCheckKey = androidx.datastore.preferences.core.longPreferencesKey("last_update_check")
 
     private val data: Flow<Preferences> get() = context.dataStore.data
 
@@ -112,6 +115,20 @@ class SettingsRepository(private val context: Context) {
     suspend fun setLastClient(packageName: String) = edit { it[lastClientKey] = packageName }
 
     suspend fun setFakeSni(sni: String) = edit { it[fakeSniKey] = sni }
+
+    /** Сторож: проверять текущую стратегию и переключаться при сбое или смене сети. */
+    val watchdog: Flow<Boolean> = data.map { it[watchdogKey] ?: true }
+
+    suspend fun setWatchdog(enabled: Boolean) = edit { it[watchdogKey] = enabled }
+
+    /** Проверять новые версии на GitHub. */
+    val checkUpdates: Flow<Boolean> = data.map { it[autoUpdateKey] ?: true }
+
+    suspend fun setCheckUpdates(enabled: Boolean) = edit { it[autoUpdateKey] = enabled }
+
+    val lastUpdateCheck: Flow<Long> = data.map { it[lastUpdateCheckKey] ?: 0L }
+
+    suspend fun setLastUpdateCheck(time: Long) = edit { it[lastUpdateCheckKey] = time }
 
     private suspend fun edit(block: (androidx.datastore.preferences.core.MutablePreferences) -> Unit) {
         context.dataStore.edit(block)

@@ -14,6 +14,9 @@ sealed interface TunnelStatus {
     data class Failed(val reason: FailReason, val details: String?) : TunnelStatus
 }
 
+/** Последняя проверка сторожа: когда и прошли ли узлы YouTube через текущую стратегию. */
+data class WatchdogStatus(val checkedAt: Long, val ok: Boolean)
+
 /** Объём трафика через туннель с момента запуска и текущая скорость (байт/с). */
 data class Traffic(val rxBytes: Long = 0, val txBytes: Long = 0, val rxRate: Long = 0, val txRate: Long = 0)
 
@@ -29,11 +32,21 @@ object TunnelState {
     /** Последние строки вывода byedpi — экран диагностики. */
     val log: StateFlow<List<String>> = _log.asStateFlow()
 
+    private val _watchdog = MutableStateFlow<WatchdogStatus?>(null)
+    val watchdog: StateFlow<WatchdogStatus?> = _watchdog.asStateFlow()
+
     val isActive: Boolean get() = status.value.let { it is TunnelStatus.Running || it is TunnelStatus.Starting }
 
     internal fun set(status: TunnelStatus) {
         _status.value = status
-        if (status !is TunnelStatus.Running) _traffic.value = Traffic()
+        if (status !is TunnelStatus.Running) {
+            _traffic.value = Traffic()
+            _watchdog.value = null
+        }
+    }
+
+    internal fun setWatchdog(status: WatchdogStatus) {
+        _watchdog.value = status
     }
 
     internal fun setTraffic(traffic: Traffic) {

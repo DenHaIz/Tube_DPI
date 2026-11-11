@@ -30,7 +30,6 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -46,6 +45,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.graphics.drawable.toBitmap
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.tube.dpi.R
+import com.tube.dpi.update.UpdateState
 import com.tube.dpi.vpn.FailReason
 import com.tube.dpi.vpn.TunnelStatus
 import com.tube.ui.components.AmbientBackground
@@ -66,6 +66,7 @@ import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.File
 
 enum class Sheet { None, Strategy, Apps, Settings, Autostart, Log }
 
@@ -77,6 +78,8 @@ class ShellActions(
     val openClient: (String) -> Unit,
     val openAutostartOem: () -> Unit,
     val openBattery: () -> Unit,
+    /** Открыть скачанный APK в системном установщике (сначала — разрешение «Установка приложений»). */
+    val installUpdate: (File) -> Unit = {},
 )
 
 @Composable
@@ -118,7 +121,10 @@ private fun HomeScreen(vm: MainViewModel, actions: ShellActions, onOpen: (Sheet)
     val clients by vm.clients.collectAsStateWithLifecycle()
     val autostart by vm.autostartEnabled.collectAsStateWithLifecycle()
     val stopDelay by vm.stopDelay.collectAsStateWithLifecycle()
-    val testResults by vm.testResults.collectAsStateWithLifecycle()
+    val results by vm.results.collectAsStateWithLifecycle()
+    val test by vm.test.collectAsStateWithLifecycle()
+    val watchdog by vm.watchdog.collectAsStateWithLifecycle()
+    val update by vm.update.collectAsStateWithLifecycle()
 
     val orb = when (status) {
         is TunnelStatus.Running -> OrbState.On
@@ -139,14 +145,13 @@ private fun HomeScreen(vm: MainViewModel, actions: ShellActions, onOpen: (Sheet)
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Image(painterResource(R.drawable.tube_mark), contentDescription = null, modifier = Modifier.size(44.dp))
             Spacer(Modifier.size(10.dp))
-            Column(Modifier.weight(1f)) {
-                Text("Tube", style = MaterialTheme.typography.headlineSmall, color = colors.textPrimary)
-                Text(tr("Обход блокировок YouTube", "YouTube unblocking"), style = MaterialTheme.typography.labelMedium, color = colors.textSecondary)
-            }
+            Text("Tube", style = MaterialTheme.typography.headlineSmall, color = colors.textPrimary, modifier = Modifier.weight(1f))
             GlassIconButton(TubeIcons.Sliders, tr("Настройки", "Settings")) { onOpen(Sheet.Settings) }
         }
 
-        Spacer(Modifier.height(20.dp))
+        UpdateBanner(update, vm, actions)
+
+        Spacer(Modifier.height(16.dp))
         PowerOrb(orb, tr("Включить или выключить обход", "Toggle unblocking"), onClick = {
             if (status is TunnelStatus.Running || status is TunnelStatus.Starting) vm.toggleTunnel() else actions.start()
         })
@@ -161,18 +166,23 @@ private fun HomeScreen(vm: MainViewModel, actions: ShellActions, onOpen: (Sheet)
                 }
                 FitText(title, style = MaterialTheme.typography.titleLarge, color = if (st is TunnelStatus.Failed) colors.danger else colors.textPrimary)
                 val subtitle = when (st) {
-                    is TunnelStatus.Running -> "↓ ${lang.bytes(traffic.rxBytes)} · ${lang.rate(traffic.rxRate)}   ↑ ${lang.bytes(traffic.txBytes)}"
+                    is TunnelStatus.Running -> "↓ ${lang.bytes(traffic.rxBytes)} · ${lang.rate(traffic.rxRate)}"
                     TunnelStatus.Stopped -> tr("Нажмите, чтобы включить", "Tap to turn on")
-                    is TunnelStatus.Failed -> st.details?.lineSequence()?.firstOrNull()?.take(120)
+                    is TunnelStatus.Failed -> st.details?.lineSequence()?.firstOrNull()?.take(80)
                     TunnelStatus.Starting -> null
                 }
                 if (subtitle != null) {
+                    Text(subtitle, style = MaterialTheme.typography.bodyMedium, color = colors.textSecondary, textAlign = TextAlign.Center, modifier = Modifier.padding(top = 2.dp))
+                }
+                val check = watchdog
+                if (st is TunnelStatus.Running && check != null) {
                     Text(
-                        subtitle,
-                        style = MaterialTheme.typography.labelMedium,
-                        color = colors.textSecondary,
+                        if (check.ok) tr("✓ YouTube доступен · ${lang.ago(check.checkedAt)}", "✓ YouTube reachable · ${lang.ago(check.checkedAt)}")
+                        else tr("✕ YouTube не отвечает — ищу замену", "✕ YouTube not responding — finding a fix"),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (check.ok) colors.success else colors.warning,
                         textAlign = TextAlign.Center,
-                        modifier = Modifier.padding(top = 4.dp),
+                        modifier = Modifier.padding(top = 2.dp),
                     )
                 }
                 if (st is TunnelStatus.Failed) {
@@ -182,7 +192,7 @@ private fun HomeScreen(vm: MainViewModel, actions: ShellActions, onOpen: (Sheet)
                             PillButton(tr("Включить снова", "Turn on again"), onClick = actions.start, compact = true)
                         FailReason.NoApps -> PillButton(tr("Выбрать приложения", "Choose apps"), onClick = { onOpen(Sheet.Apps) }, compact = true)
                         FailReason.ProxyFailed -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            PillButton(tr("Сменить стратегию", "Change strategy"), onClick = { onOpen(Sheet.Strategy) }, compact = true)
+                            PillButton(tr("Стратегия", "Strategy"), onClick = { onOpen(Sheet.Strategy) }, compact = true)
                             PillButton(tr("Журнал", "Log"), onClick = { onOpen(Sheet.Log) }, compact = true)
                         }
                     }
@@ -190,26 +200,34 @@ private fun HomeScreen(vm: MainViewModel, actions: ShellActions, onOpen: (Sheet)
             }
         }
 
-        Spacer(Modifier.height(22.dp))
+        Spacer(Modifier.height(20.dp))
 
         AnimatedVisibility(clients.isNotEmpty()) {
-            Column(Modifier.fillMaxWidth()) {
-                SectionLabel(tr("Открыть через обход", "Open with unblocking"))
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
                     clients.forEach { client ->
                         ClientChip(client.packageName, client.label) { actions.openClient(client.packageName) }
                     }
                 }
-                Spacer(Modifier.height(18.dp))
+                Spacer(Modifier.height(16.dp))
             }
         }
 
-        val score = testResults[strategy.id]
+        val score = results?.scores?.get(strategy.id)
+        val working = results?.working?.size ?: 0
         InfoCard(
             icon = TubeIcons.Bolt,
             title = tr("Стратегия", "Strategy"),
-            value = strategy.name + (score?.let { " · ${it.passed}/${it.total}" } ?: ""),
-            hint = if (testResults.isEmpty()) tr("Подберите лучшую для вашего провайдера", "Find the best one for your ISP") else lang.pick(strategy.descriptionRu, strategy.descriptionEn),
+            value = strategy.name + (score?.takeIf { it.works }?.let { " · ${it.avgMillis} ${lang.pick("мс", "ms")}" } ?: ""),
+            hint = when {
+                test.running -> tr("Подбор: ${test.done} из ${test.total}", "Testing: ${test.done} of ${test.total}")
+                results == null || results?.testedAt == 0L -> tr("Нажмите, чтобы подобрать", "Tap to auto-pick")
+                else -> tr("Рабочих в этой сети: $working", "Working on this network: $working")
+            },
+            warning = results != null && results?.testedAt != 0L && working == 0,
         ) { onOpen(Sheet.Strategy) }
         Spacer(Modifier.height(10.dp))
 
@@ -219,23 +237,22 @@ private fun HomeScreen(vm: MainViewModel, actions: ShellActions, onOpen: (Sheet)
             title = tr("Приложения", "Apps"),
             value = when {
                 installed == null -> "…"
-                selectedNames.isEmpty() -> tr("Не выбрано", "None selected")
+                selectedNames.isEmpty() -> tr("Не выбраны", "None selected")
                 else -> lang.plural(selectedNames.size, "${selectedNames.size} приложение", "${selectedNames.size} приложения", "${selectedNames.size} приложений", "${selectedNames.size} app", "${selectedNames.size} apps")
             },
-            hint = selectedNames.take(4).joinToString(", ").ifEmpty { tr("Трафик остальных приложений идёт напрямую", "Other apps bypass the tunnel") },
+            hint = selectedNames.take(3).joinToString(", ").ifEmpty { tr("Остальные идут напрямую", "Others go direct") },
             warning = installed != null && selectedNames.isEmpty(),
         ) { onOpen(Sheet.Apps) }
         Spacer(Modifier.height(10.dp))
 
         InfoCard(
             icon = TubeIcons.Eye,
-            title = tr("Автозапуск с YouTube", "Start with YouTube"),
+            title = tr("Запуск с YouTube", "Start with YouTube"),
             value = if (autostart) tr("Включён", "On") else tr("Выключен", "Off"),
-            hint = if (autostart) {
-                if (stopDelay == 0) tr("Включается при открытии YouTube и не выключается сам", "Turns on when YouTube opens and stays on")
-                else tr("Включается при открытии YouTube, выключается через ${lang.stopDelay(stopDelay)} после ухода", "Turns on when YouTube opens, off ${lang.stopDelay(stopDelay)} after you leave")
-            } else {
-                tr("Нажмите, чтобы обход включался сам вместе с YouTube", "Tap to make it start together with YouTube")
+            hint = when {
+                !autostart -> tr("Нажмите, чтобы настроить", "Tap to set up")
+                stopDelay == 0 -> tr("Не выключается сам", "Stays on")
+                else -> tr("Выключение через ${lang.stopDelay(stopDelay)}", "Turns off after ${lang.stopDelay(stopDelay)}")
             },
             warning = !autostart,
         ) { onOpen(Sheet.Autostart) }
@@ -243,13 +260,55 @@ private fun HomeScreen(vm: MainViewModel, actions: ShellActions, onOpen: (Sheet)
     }
 }
 
+/** Плашка новой версии: что нового и кнопка обновления с прогрессом скачивания. */
+@Composable
+private fun UpdateBanner(state: UpdateState, vm: MainViewModel, actions: ShellActions) {
+    val colors = TubeTheme.colors
+    val release = when (state) {
+        is UpdateState.Available -> state.release
+        is UpdateState.Downloading -> state.release
+        is UpdateState.Ready -> state.release
+        else -> null
+    }
+    AnimatedVisibility(release != null) {
+        release ?: return@AnimatedVisibility
+        FrostedCard(
+            Modifier
+                .fillMaxWidth()
+                .padding(top = 14.dp),
+        ) {
+            Column(Modifier.padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(tr("Доступна версия ${release.version}", "Version ${release.version} is available"), style = MaterialTheme.typography.titleMedium, color = colors.textPrimary)
+                val notes = release.notes.lineSequence().map { it.trim().removePrefix("**RU**").removePrefix("—").trim() }.firstOrNull { it.isNotEmpty() && !it.startsWith("**EN**") }
+                if (notes != null) {
+                    Text(notes, style = MaterialTheme.typography.bodyMedium, color = colors.textSecondary, textAlign = TextAlign.Center, maxLines = 3)
+                }
+                Spacer(Modifier.height(10.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    when (state) {
+                        is UpdateState.Downloading -> PillButton(tr("Скачивание ${(state.progress * 100).toInt()}%", "Downloading ${(state.progress * 100).toInt()}%"), onClick = {}, enabled = false, compact = true)
+                        is UpdateState.Ready -> PillButton(tr("Установить", "Install"), onClick = { actions.installUpdate(state.apk) }, filled = true, compact = true)
+                        else -> {
+                            PillButton(tr("Обновить", "Update"), onClick = { vm.downloadUpdate(release) }, filled = true, compact = true)
+                            PillButton(tr("Позже", "Later"), onClick = vm::dismissUpdate, compact = true)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 @Composable
 fun SectionLabel(text: String, modifier: Modifier = Modifier) {
     Text(
-        text.uppercase(),
-        style = MaterialTheme.typography.labelSmall,
+        text,
+        style = MaterialTheme.typography.labelLarge,
         color = TubeTheme.colors.textSecondary,
-        modifier = modifier.padding(start = 4.dp, bottom = 8.dp),
+        textAlign = TextAlign.Center,
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(bottom = 6.dp),
     )
 }
 
@@ -266,6 +325,7 @@ fun GlassIconButton(icon: ImageVector, description: String, onClick: () -> Unit)
     }
 }
 
+/** Карточка главного экрана: всё по центру — подпись со значком, значение крупно, одна строка пояснения. */
 @Composable
 private fun InfoCard(
     icon: ImageVector,
@@ -282,25 +342,19 @@ private fun InfoCard(
             .fillMaxWidth()
             .bouncyClickable(pressedScale = 0.97f, onClick = onClick),
     ) {
-        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(
-                Modifier
-                    .size(44.dp)
-                    .clip(Shapes.Chip)
-                    .background(iconColor.copy(alpha = 0.16f)),
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(icon, contentDescription = null, tint = iconColor, modifier = Modifier.size(22.dp))
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 14.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(icon, contentDescription = null, tint = iconColor, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.size(6.dp))
+                Text(title, style = MaterialTheme.typography.labelLarge, color = colors.textSecondary)
             }
-            Spacer(Modifier.size(14.dp))
-            Column(Modifier.weight(1f)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(title, style = MaterialTheme.typography.labelMedium, color = colors.textSecondary, modifier = Modifier.weight(1f, fill = false))
-                }
-                FitText(value, style = MaterialTheme.typography.titleMedium, color = colors.textPrimary)
-                Text(hint, style = MaterialTheme.typography.labelMedium, color = colors.textTertiary, maxLines = 2)
-            }
-            Icon(TubeIcons.ChevronRight, contentDescription = null, tint = colors.textTertiary, modifier = Modifier.size(20.dp))
+            FitText(value, style = MaterialTheme.typography.titleLarge, color = colors.textPrimary)
+            Text(hint, style = MaterialTheme.typography.bodyMedium, color = if (warning) colors.warning else colors.textTertiary, textAlign = TextAlign.Center, maxLines = 1)
         }
     }
 }
@@ -332,7 +386,7 @@ fun AppIcon(packageName: String, modifier: Modifier = Modifier) {
             runCatching { context.packageManager.getApplicationIcon(packageName).toBitmap(96, 96).asImageBitmap() }.getOrNull()
         }
     }
-    Box(modifier) {
+    Box(modifier.clip(Shapes.Chip)) {
         icon?.let { Image(it, contentDescription = null, modifier = Modifier.fillMaxSize()) }
     }
 }

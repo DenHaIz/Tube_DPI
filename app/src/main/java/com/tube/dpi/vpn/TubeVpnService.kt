@@ -11,6 +11,7 @@ import com.tube.byedpi.ByeDpiProcess
 import com.tube.byedpi.StrategyArgs
 import com.tube.dpi.TubeApp
 import com.tube.dpi.apps.TargetApps
+import com.tube.dpi.strategy.StrategyWatchdog
 import com.tube.tunnel.TProxyService
 import com.tube.tunnel.TunnelConfig
 import kotlinx.coroutines.CoroutineScope
@@ -47,6 +48,7 @@ class TubeVpnService : VpnService() {
     private var proxy: ByeDpiProcess? = null
     private var tun: ParcelFileDescriptor? = null
     private var monitor: Job? = null
+    private var watchdog: Job? = null
 
     private val container get() = (application as TubeApp).container
 
@@ -75,6 +77,11 @@ class TubeVpnService : VpnService() {
 
     private suspend fun startTunnel(byAutostart: Boolean) {
         TunnelState.set(TunnelStatus.Starting)
+        // В знакомой сети — стратегия, которая там работала (выбрана вручную или сторожем).
+        container.network.refresh()
+        container.results.of(container.network.current.value?.key)?.chosen?.let { chosen ->
+            if (container.resolveStrategy(chosen) != null) container.settings.setStrategy(chosen)
+        }
         val settings = container.settings.tunnelSettings { TargetApps.defaultTargets(this) }
         val installed = settings.targets.filter { TargetApps.isInstalled(this, it) }
         if (installed.isEmpty()) return fail(FailReason.NoApps, null)
@@ -132,6 +139,13 @@ class TubeVpnService : VpnService() {
         Notifications.cancelAlerts(this)
         TunnelState.set(TunnelStatus.Running(System.currentTimeMillis(), settings.strategy.name, byAutostart))
         monitor = scope.launch { monitorLoop() }
+        watchdog = scope.launch {
+            StrategyWatchdog(this@TubeVpnService, container, PROXY_PORT, settings.strategy.id) { next, reason ->
+                container.chooseStrategy(next.id)
+                Notifications.showSwitched(this@TubeVpnService, settings.strategy.name, next.name, reason)
+                startService(Intent(this@TubeVpnService, TubeVpnService::class.java).setAction(ACTION_RESTART).putExtra(EXTRA_BY_AUTOSTART, byAutostart))
+            }.run()
+        }
     }
 
     /** Следит, что byedpi жив, и считает трафик для экрана и автозапуска. */
@@ -172,6 +186,8 @@ class TubeVpnService : VpnService() {
     private fun teardown() {
         monitor?.cancel()
         monitor = null
+        watchdog?.cancel()
+        watchdog = null
         runCatching { TProxyService.TProxyStopService() }
         runCatching { tun?.close() }
         tun = null

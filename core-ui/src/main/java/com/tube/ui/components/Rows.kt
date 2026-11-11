@@ -30,6 +30,7 @@ import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.toggleableState
 import androidx.compose.ui.state.ToggleableState
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import com.tube.ui.glass.FrostedCard
@@ -39,7 +40,7 @@ import com.tube.ui.theme.TubeTheme
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
-/** Матовая карточка с заголовком-капсом — как группы в настройках Woody. */
+/** Матовая карточка с заголовком по центру — как группы в настройках Woody. */
 @Composable
 fun SettingsCard(
     title: String,
@@ -49,11 +50,14 @@ fun SettingsCard(
     FrostedCard(modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp)) {
             Text(
-                title.uppercase(),
-                style = MaterialTheme.typography.labelSmall,
-                color = TubeTheme.colors.textSecondary,
+                title,
+                style = MaterialTheme.typography.titleMedium,
+                color = TubeTheme.colors.textPrimary,
+                textAlign = TextAlign.Center,
                 maxLines = 1,
-                modifier = Modifier.padding(bottom = 12.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 12.dp),
             )
             content()
         }
@@ -81,7 +85,7 @@ fun ToggleRow(title: String, status: String, checked: Boolean, enabled: Boolean 
         Spacer(Modifier.size(12.dp))
         Column(Modifier.weight(1f)) {
             FitText(title, style = MaterialTheme.typography.titleMedium, color = colors.textPrimary)
-            Text(status, style = MaterialTheme.typography.labelMedium, color = colors.textSecondary, maxLines = 4)
+            Text(status, style = MaterialTheme.typography.bodyMedium, color = colors.textSecondary, maxLines = 3)
         }
         Box(
             Modifier
@@ -127,7 +131,7 @@ fun PermissionRow(
         Spacer(Modifier.size(12.dp))
         Column(Modifier.weight(1f)) {
             FitText(title, style = MaterialTheme.typography.titleMedium, color = colors.textPrimary)
-            Text(status, style = MaterialTheme.typography.labelMedium, color = colors.textSecondary, maxLines = 4)
+            Text(status, style = MaterialTheme.typography.bodyMedium, color = colors.textSecondary, maxLines = 3)
         }
         if (!ok) {
             PillButton(action, onClick = onAction, modifier = Modifier.padding(start = 8.dp), compact = true)
@@ -176,16 +180,22 @@ fun PillButton(
     }
 }
 
-/** Заголовок листа: крупный текст и необязательное пояснение. */
+/** Заголовок листа по центру: крупный текст и необязательная короткая подпись. */
 @Composable
 fun SheetTitle(title: String, subtitle: String? = null, modifier: Modifier = Modifier) {
-    Column(modifier.padding(horizontal = 20.dp, vertical = 4.dp)) {
-        Text(title, style = MaterialTheme.typography.headlineSmall, color = TubeTheme.colors.textPrimary)
+    Column(
+        modifier
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp, vertical = 4.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(title, style = MaterialTheme.typography.headlineSmall, color = TubeTheme.colors.textPrimary, textAlign = TextAlign.Center)
         if (subtitle != null) {
             Text(
                 subtitle,
                 style = MaterialTheme.typography.bodyMedium,
                 color = TubeTheme.colors.textSecondary,
+                textAlign = TextAlign.Center,
                 modifier = Modifier.padding(top = 4.dp),
             )
         }

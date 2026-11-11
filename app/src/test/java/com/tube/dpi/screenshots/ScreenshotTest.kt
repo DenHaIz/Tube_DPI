@@ -20,6 +20,7 @@ import com.tube.byedpi.ProbeResult
 import com.tube.byedpi.Strategies
 import com.tube.byedpi.StrategyScore
 import com.tube.dpi.TubeApp
+import com.tube.dpi.data.NetworkResults
 import com.tube.dpi.ui.MainViewModel
 import com.tube.dpi.ui.ShellActions
 import com.tube.dpi.ui.TubeAppShell
@@ -55,7 +56,7 @@ class ScreenshotTest {
     @After
     fun reset() {
         TunnelState.set(TunnelStatus.Stopped)
-        app.container.testResults.value = emptyMap()
+        app.container.results.clear()
     }
 
     private fun render(dark: Boolean, lang: AppLanguage = AppLanguage.Russian) {
@@ -80,15 +81,27 @@ class ScreenshotTest {
     private fun shot(name: String) = compose.onRoot().captureRoboImage("build/outputs/roborazzi/$name.png")
 
     private fun fakeResults() {
-        val probes = listOf(Probe("www.youtube.com", "/", 1), Probe("i.ytimg.com", "/", 1), Probe("rr1---sn-abc.googlevideo.com", "/", 0))
-        app.container.testResults.value = Strategies.builtIn.mapIndexed { i, s ->
-            val passed = when {
-                i % 4 == 0 -> 3
-                i % 4 == 1 -> 1
-                else -> if (i % 3 == 0) 0 else 3
+        val probes = listOf(Probe("www.youtube.com", "/", 1), Probe("i.ytimg.com", "/", 1), Probe("redirector.googlevideo.com", "/", 0))
+        fun score(s: com.tube.byedpi.Strategy, passed: Int, ms: Long) = StrategyScore(s, probes.mapIndexed { j, p -> ProbeResult(p, j < passed, ms, 0, if (j < passed) null else "SocketTimeoutException") })
+        val all = Strategies.builtIn + Strategies.extended.take(6)
+        val scores = all.mapIndexed { i, s ->
+            val passed = when (i % 5) {
+                0, 3 -> 3
+                1 -> 1
+                else -> 0
             }
-            s.id to StrategyScore(s, probes.mapIndexed { j, p -> ProbeResult(p, j < passed, 300L + i * 37, 0, null) })
+            s.id to score(s, passed, 280L + i * 23)
         }.toMap()
+        app.container.network.refresh()
+        val key = app.container.network.current.value?.key ?: "test"
+        app.container.results.update(key) {
+            NetworkResults(
+                testedAt = System.currentTimeMillis() - 12 * 60_000,
+                systemDns = false,
+                baseline = StrategyScore(com.tube.byedpi.Strategy("direct", "DIRECT", "", "", ""), probes.map { ProbeResult(it, it.host.startsWith("i."), 100, 0, "reset") }),
+                scores = scores,
+            )
+        }
     }
 
     @Test
@@ -101,6 +114,7 @@ class ScreenshotTest {
     fun homeRunningDark() {
         TunnelState.set(TunnelStatus.Running(System.currentTimeMillis(), "DISORDER SNI", byAutostart = true))
         TunnelState.setTraffic(Traffic(rxBytes = 734_003_200, txBytes = 12_582_912, rxRate = 2_411_724))
+        TunnelState.setWatchdog(com.tube.dpi.vpn.WatchdogStatus(System.currentTimeMillis() - 3 * 60_000, ok = true))
         fakeResults()
         render(dark = true)
         shot("home_running_dark")
@@ -133,7 +147,7 @@ class ScreenshotTest {
     @Test
     fun autostartSheet() {
         render(dark = true)
-        compose.onNodeWithText("Автозапуск с YouTube").performClick()
+        compose.onNodeWithText("Запуск с YouTube").performClick()
         compose.waitForIdle()
         shot("sheet_autostart_dark")
     }

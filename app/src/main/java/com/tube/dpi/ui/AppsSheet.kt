@@ -49,10 +49,7 @@ fun ColumnScope.AppsSheet(vm: MainViewModel) {
 
     SheetTitle(
         tr("Приложения", "Apps"),
-        tr(
-            "Через обход идёт трафик только отмеченных приложений — остальные работают как обычно.",
-            "Only checked apps go through the unblocking — everything else works as usual.",
-        ),
+        tr("Остальные работают напрямую", "The rest go direct"),
     )
     Spacer(Modifier.height(12.dp))
 

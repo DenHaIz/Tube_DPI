@@ -27,6 +27,7 @@ data class StrategyScore(val strategy: Strategy, val results: List<ProbeResult>,
     val total: Int get() = results.size
     val avgMillis: Long get() = results.filter { it.ok }.map { it.millis }.average().takeIf { !it.isNaN() }?.toLong() ?: Long.MAX_VALUE
     val works: Boolean get() = total > 0 && passed == total
+    val partial: Boolean get() = passed in 1 until total
 }
 
 sealed interface TestEvent {
@@ -71,7 +72,8 @@ class StrategyTester(
         send(TestEvent.Finished(rank(scores)))
     }.flowOn(Dispatchers.IO)
 
-    private suspend fun testOne(strategy: Strategy, port: Int, probes: List<Probe>, blockUdp: Boolean): StrategyScore {
+    /** Одна стратегия на своём экземпляре byedpi (порт [port] должен быть свободен). */
+    suspend fun testOne(strategy: Strategy, port: Int, probes: List<Probe>, blockUdp: Boolean): StrategyScore {
         val argv = when (val parsed = StrategyArgs.parse(strategy.args)) {
             is StrategyArgs.Result.Ok -> parsed.argv
             is StrategyArgs.Result.Error -> return StrategyScore(strategy, emptyList(), parsed.message)
@@ -89,6 +91,11 @@ class StrategyTester(
         } finally {
             proxy.stop()
         }
+    }
+
+    /** Проверки через уже работающий прокси (сторож проверяет текущую стратегию, не останавливая VPN). */
+    suspend fun checkThrough(port: Int, probes: List<Probe>): List<ProbeResult> = coroutineScope {
+        probes.map { probe -> async(Dispatchers.IO) { probe(port, probe) } }.awaitAll()
     }
 
     private suspend fun probe(port: Int?, probe: Probe): ProbeResult {

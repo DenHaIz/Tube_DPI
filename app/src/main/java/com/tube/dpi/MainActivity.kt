@@ -59,6 +59,12 @@ class MainActivity : ComponentActivity() {
             },
             openAutostartOem = { OemPower.openAutostart(this) },
             openBattery = { OemPower.openBatterySettings(this) },
+            installUpdate = { apk ->
+                val updates = container.updates
+                // Android 8+: сначала разрешить Tube устанавливать приложения, затем — системный установщик.
+                val intent = if (updates.canInstall()) updates.installIntent(apk) else updates.installPermissionIntent()
+                runCatching { startActivity(intent) }
+            },
         )
         setContent {
             val language by container.language.collectAsStateWithLifecycle()

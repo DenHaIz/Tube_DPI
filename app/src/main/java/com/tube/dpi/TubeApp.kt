@@ -2,7 +2,13 @@ package com.tube.dpi
 
 import android.app.Application
 import android.content.Context
-import com.tube.byedpi.StrategyScore
+import com.tube.byedpi.Strategies
+import com.tube.byedpi.Strategy
+import com.tube.dpi.data.NetworkMonitor
+import com.tube.dpi.data.ResultsStore
+import com.tube.dpi.strategy.AutoPick
+import com.tube.dpi.update.UpdateChecker
+import kotlinx.coroutines.flow.first
 import com.tube.dpi.data.SettingsRepository
 import com.tube.dpi.data.ThemeMode
 import com.tube.dpi.tile.TubeTileService
@@ -30,7 +36,13 @@ class TubeApp : Application() {
 
 /** Ручной DI: все зависимости создаются лениво, при первом обращении. */
 class AppContainer(context: Context) {
-    val settings: SettingsRepository by lazy { SettingsRepository(context) }
+    private val appContext = context.applicationContext
+
+    val settings: SettingsRepository by lazy { SettingsRepository(appContext) }
+    val network: NetworkMonitor by lazy { NetworkMonitor(appContext) }
+    val results: ResultsStore by lazy { ResultsStore(appContext) }
+    val autoPick: AutoPick by lazy { AutoPick(appContext, settings, results, network, scope) }
+    val updates: UpdateChecker by lazy { UpdateChecker(appContext, settings) }
 
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
@@ -42,9 +54,16 @@ class AppContainer(context: Context) {
     val themeMode: StateFlow<ThemeMode?> by lazy { settings.themeMode.stateIn(scope, SharingStarted.Eagerly, null) }
     val dynamicColors: StateFlow<Boolean?> by lazy { settings.dynamicColors.stateIn(scope, SharingStarted.Eagerly, null) }
 
-    /** Результаты последнего автоподбора по id стратегии — до перезапуска процесса. */
-    val testResults = MutableStateFlow<Map<String, StrategyScore>>(emptyMap())
+    /** Стратегия по id: встроенная, из набора ByeByeDPI или своя. */
+    suspend fun resolveStrategy(id: String): Strategy? = when (id) {
+        Strategies.CUSTOM_ID -> settings.customArgs.first().takeIf { it.isNotBlank() }
+            ?.let { Strategy(Strategies.CUSTOM_ID, "CUSTOM", it, "Своя стратегия", "Custom strategy") }
+        else -> Strategies.byId(id)
+    }
 
-    /** Подробности последнего автоподбора (ошибки по каждому узлу) — для журнала. */
-    val testLog = MutableStateFlow<List<String>>(emptyList())
+    /** Выбрать стратегию: глобально и для текущей сети. */
+    suspend fun chooseStrategy(id: String) {
+        settings.setStrategy(id)
+        network.current.value?.key?.let { key -> results.update(key) { it.copy(chosen = id) } }
+    }
 }

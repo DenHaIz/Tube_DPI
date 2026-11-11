@@ -6,19 +6,20 @@ import androidx.lifecycle.viewModelScope
 import com.tube.byedpi.Strategies
 import com.tube.byedpi.Strategy
 import com.tube.byedpi.StrategyArgs
-import com.tube.byedpi.StrategyScore
-import com.tube.byedpi.StrategyTester
-import com.tube.byedpi.TestEvent
 import com.tube.dpi.TubeApp
 import com.tube.dpi.apps.InstalledApp
 import com.tube.dpi.apps.TargetApps
 import com.tube.dpi.autostart.AutoStartService
+import com.tube.dpi.data.NetworkId
+import com.tube.dpi.data.NetworkResults
 import com.tube.dpi.data.ThemeMode
+import com.tube.dpi.strategy.TestProgress
+import com.tube.dpi.update.Release
+import com.tube.dpi.update.UpdateState
 import com.tube.dpi.vpn.TunnelState
 import com.tube.dpi.vpn.VpnController
 import com.tube.ui.i18n.AppLanguage
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -28,18 +29,6 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-
-/** Ход автоподбора стратегии. */
-data class TestProgress(
-    val running: Boolean = false,
-    val done: Int = 0,
-    val total: Int = 0,
-    /** Отдаёт ли DNS провайдера адрес youtube.com; null — ещё не проверено. */
-    val systemDns: Boolean? = null,
-    /** Те же проверки без обхода: блокирует ли сеть YouTube вообще. */
-    val baseline: StrategyScore? = null,
-    val ranking: List<StrategyScore> = emptyList(),
-)
 
 class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val container = (app as TubeApp).container
@@ -59,8 +48,17 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     val themeMode: StateFlow<ThemeMode> = settings.themeMode.stateIn(viewModelScope, SharingStarted.Eagerly, ThemeMode.System)
     val dynamicColors: StateFlow<Boolean> = settings.dynamicColors.stateIn(viewModelScope, SharingStarted.Eagerly, false)
     val language: StateFlow<AppLanguage> = settings.language.stateIn(viewModelScope, SharingStarted.Eagerly, AppLanguage.Russian)
-    val testResults: StateFlow<Map<String, StrategyScore>> = container.testResults
-    val testLog: StateFlow<List<String>> = container.testLog
+    val watchdogEnabled: StateFlow<Boolean> = settings.watchdog.stateIn(viewModelScope, SharingStarted.Eagerly, true)
+    val checkUpdates: StateFlow<Boolean> = settings.checkUpdates.stateIn(viewModelScope, SharingStarted.Eagerly, true)
+    val watchdog = TunnelState.watchdog
+
+    /** Текущая сеть и сохранённые для неё результаты подбора. */
+    val network: StateFlow<NetworkId?> = container.network.current
+    val results: StateFlow<NetworkResults?> = combine(container.network.current, container.results.all) { id, all -> id?.let { all[it.key] } }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+    val test: StateFlow<TestProgress> = container.autoPick.progress
+    val testLog: StateFlow<List<String>> = container.autoPick.log
+    val update: StateFlow<UpdateState> = container.updates.state
 
     private val _installed = MutableStateFlow<List<InstalledApp>?>(null)
     /** Приложения с доступом в интернет; null — список ещё загружается. */
@@ -81,19 +79,21 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val _autostartEnabled = MutableStateFlow(false)
     val autostartEnabled: StateFlow<Boolean> = _autostartEnabled.asStateFlow()
 
-    private val _test = MutableStateFlow(TestProgress())
-    val test: StateFlow<TestProgress> = _test.asStateFlow()
-    private var testJob: Job? = null
+    private val _testingId = MutableStateFlow<String?>(null)
+    /** Стратегия, которую сейчас проверяют по одной (кнопка «Проверить»). */
+    val testingId: StateFlow<String?> = _testingId.asStateFlow()
 
     init {
         viewModelScope.launch {
             targets.map { it }.collect { refreshClients(it) }
         }
+        viewModelScope.launch { container.updates.checkIfDue() }
     }
 
     /** При каждом возвращении на экран: службу могли включить в настройках, приложения — поставить или удалить. */
     fun refresh() {
         _autostartEnabled.value = AutoStartService.isEnabled(context)
+        container.network.refresh()
         viewModelScope.launch {
             val (defaults, apps) = withContext(Dispatchers.IO) { TargetApps.defaultTargets(context) to TargetApps.installed(context) }
             _defaults.value = defaults
@@ -111,9 +111,32 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun startTunnel() = VpnController.start(context)
 
     fun selectStrategy(id: String) = viewModelScope.launch {
-        settings.setStrategy(id)
+        container.chooseStrategy(id)
         VpnController.restartIfRunning(context)
     }
+
+    /** Проверить одну стратегию (результат сохраняется для текущей сети). */
+    fun testStrategy(strategy: Strategy) {
+        if (_testingId.value != null || test.value.running) return
+        _testingId.value = strategy.id
+        viewModelScope.launch {
+            try {
+                container.autoPick.testOne(strategy)
+            } finally {
+                _testingId.value = null
+            }
+        }
+    }
+
+    fun setWatchdog(enabled: Boolean) = viewModelScope.launch { settings.setWatchdog(enabled) }
+
+    fun setCheckUpdates(enabled: Boolean) = viewModelScope.launch { settings.setCheckUpdates(enabled) }
+
+    fun checkForUpdate() = viewModelScope.launch { container.updates.check() }
+
+    fun downloadUpdate(release: Release) = viewModelScope.launch { container.updates.download(release) }
+
+    fun dismissUpdate() = container.updates.dismiss()
 
     /** null — строка принята; иначе — опция, на которой споткнулся разбор. */
     fun saveCustomArgs(args: String): String? {
@@ -139,7 +162,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setFakeSni(sni: String) = viewModelScope.launch {
         settings.setFakeSni(sni)
-        container.testResults.value = emptyMap()
         VpnController.restartIfRunning(context)
     }
 
@@ -153,51 +175,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun rememberClient(packageName: String) = viewModelScope.launch { settings.setLastClient(packageName) }
 
-    /** Перебор всех встроенных стратегий (и своей, если задана) на реальных узлах YouTube. */
+    /** Перебор всех стратегий на реальных узлах YouTube; результаты сохраняются для текущей сети. */
     fun runTest() {
-        if (_test.value.running) return
-        val candidates = Strategies.all + listOfNotNull(
-            customArgs.value.takeIf { it.isNotBlank() }?.let { Strategy(Strategies.CUSTOM_ID, "CUSTOM", it, "", "") },
-        )
-        val tester = StrategyTester(context, fakeSni = fakeSni.value)
-        _test.value = TestProgress(running = true, total = candidates.size)
-        testJob = viewModelScope.launch {
-            val probes = StrategyTester.defaultProbes()
-            val systemDns = withContext(Dispatchers.IO) { tester.systemDnsResolves() }
-            val baseline = tester.baseline(probes)
-            _test.value = _test.value.copy(baseline = baseline, systemDns = systemDns)
-            container.testLog.value = listOf("system DNS resolves www.youtube.com: $systemDns", "fake SNI: ${fakeSni.value}", describe(baseline))
-            val blockUdp = blockQuic.value
-            tester.run(candidates, probes, blockUdp).collect { event ->
-                when (event) {
-                    is TestEvent.Progress -> {
-                        container.testResults.value = container.testResults.value + (event.score.strategy.id to event.score)
-                        container.testLog.value = container.testLog.value + describe(event.score)
-                        _test.value = _test.value.copy(
-                            done = event.done,
-                            ranking = StrategyTester.rank(_test.value.ranking + event.score),
-                        )
-                    }
-                    is TestEvent.Finished -> _test.value = _test.value.copy(running = false, ranking = event.ranking)
-                }
-            }
-        }
+        container.autoPick.start()
     }
 
-    /** Строка журнала: стратегия и итог по каждому узлу — видно, что именно режет провайдер. */
-    private fun describe(score: StrategyScore): String = buildString {
-        append(score.strategy.name).append(": ")
-        if (score.startError != null) {
-            append("start error: ").append(score.startError)
-            return@buildString
-        }
-        score.results.joinTo(this, "; ") { r ->
-            r.probe.host + " " + if (r.ok) "ok ${r.millis}ms" else "FAIL ${r.bytes}B ${r.error.orEmpty()}"
-        }
-    }
-
-    fun cancelTest() {
-        testJob?.cancel()
-        _test.value = _test.value.copy(running = false)
-    }
+    fun cancelTest() = container.autoPick.cancel()
 }
