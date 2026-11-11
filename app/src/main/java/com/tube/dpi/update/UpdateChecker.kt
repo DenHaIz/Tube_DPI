@@ -106,9 +106,15 @@ class UpdateChecker(private val context: Context, private val settings: Settings
         _state.value = UpdateState.Idle
     }
 
-    private fun fetchLatest(): Release? {
-        val connection = open(LATEST_URL)
-        connection.setRequestProperty("Accept", "application/vnd.github+json")
+    /** API GitHub, а если он недоступен (лимит 60 запросов в час на IP у мобильных операторов) — страница релиза. */
+    private fun fetchLatest(): Release? = try {
+        fetchFromApi()
+    } catch (api: Exception) {
+        runCatching { fetchFromPage() }.getOrElse { throw api }
+    }
+
+    private fun fetchFromApi(): Release? {
+        val connection = open(LATEST_URL, "Accept" to "application/vnd.github+json")
         val json = JSONObject(connection.inputStream.bufferedReader().use { it.readText() })
         val version = json.getString("tag_name").removePrefix("v")
         if (!isNewer(version, BuildConfig.VERSION_NAME)) return null
@@ -123,16 +129,52 @@ class UpdateChecker(private val context: Context, private val settings: Settings
         )
     }
 
-    private fun open(url: String): HttpURLConnection = (URL(url).openConnection() as HttpURLConnection).apply {
-        connectTimeout = 10_000
-        readTimeout = 20_000
-        instanceFollowRedirects = true
-        setRequestProperty("User-Agent", "Tube/${BuildConfig.VERSION_NAME}")
-        if (responseCode !in 200..299) error("HTTP $responseCode")
+    /** github.com/…/releases/latest перенаправляет на …/tag/vX.Y; APK у каждого релиза называется Tube-X.Y.apk. */
+    private fun fetchFromPage(): Release? {
+        val connection = (URL(LATEST_PAGE).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 10_000
+            readTimeout = 20_000
+            instanceFollowRedirects = false
+            setRequestProperty("User-Agent", "Tube/${BuildConfig.VERSION_NAME}")
+        }
+        val location = try {
+            connection.getHeaderField("Location") ?: error("HTTP ${connection.responseCode}")
+        } finally {
+            connection.disconnect()
+        }
+        val tag = location.substringAfterLast("/tag/", "").takeIf { it.isNotEmpty() } ?: error("no release")
+        val version = tag.removePrefix("v")
+        if (!isNewer(version, BuildConfig.VERSION_NAME)) return null
+        return Release(
+            version = version,
+            notes = "",
+            apkUrl = "$REPO_URL/releases/download/$tag/Tube-$version.apk",
+            apkSize = 0,
+            pageUrl = "$REPO_URL/releases/tag/$tag",
+        )
+    }
+
+    /** Заголовки задаются до подключения: после обращения к responseCode менять запрос уже нельзя. */
+    private fun open(url: String, vararg headers: Pair<String, String>): HttpURLConnection {
+        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 10_000
+            readTimeout = 20_000
+            instanceFollowRedirects = true
+            setRequestProperty("User-Agent", "Tube/${BuildConfig.VERSION_NAME}")
+            headers.forEach { (name, value) -> setRequestProperty(name, value) }
+        }
+        val code = connection.responseCode
+        if (code !in 200..299) {
+            connection.disconnect()
+            error("HTTP $code")
+        }
+        return connection
     }
 
     companion object {
+        private const val REPO_URL = "https://github.com/DenHaIz/Tube_DPI"
         private const val LATEST_URL = "https://api.github.com/repos/DenHaIz/Tube_DPI/releases/latest"
+        private const val LATEST_PAGE = "$REPO_URL/releases/latest"
         private const val AUTO_INTERVAL_MS = 6 * 60 * 60_000L
 
         /** Сравнение версий по числам: 0.10 > 0.9, 1.0 > 0.9.9. */

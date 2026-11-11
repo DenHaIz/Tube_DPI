@@ -23,8 +23,11 @@ class LocalDns private constructor(private val socket: DatagramSocket) {
     /** Значение переменной окружения TUBE_DNS для byedpi. */
     val address: String get() = "127.0.0.1:$port"
 
-    private val workers = Executors.newFixedThreadPool(4) { r -> Thread(r, "tube-dns").apply { isDaemon = true } }
-    private val cache = ConcurrentHashMap<String, Pair<Long, ByteArray>>()
+    private val workers = Executors.newFixedThreadPool(8) { r -> Thread(r, "tube-dns").apply { isDaemon = true } }
+    private class Entry(val freshUntil: Long, val staleUntil: Long, val body: ByteArray)
+
+    private val cache = ConcurrentHashMap<String, Entry>()
+    private val refreshing = ConcurrentHashMap.newKeySet<String>()
     @Volatile private var preferred = 0
 
     init {
@@ -43,21 +46,59 @@ class LocalDns private constructor(private val socket: DatagramSocket) {
         }
     }
 
-    /** Ответ на DNS-запрос (wire format) с тем же id; null — ни один DoH-сервер не ответил. */
+    /**
+     * Ответ на DNS-запрос (wire format) с тем же id; null — ни один DoH-сервер не ответил.
+     *
+     * byedpi резолвит имена синхронно, в своём единственном потоке: пока ждём DoH, стоят все его соединения.
+     * Поэтому устаревший ответ отдаётся сразу и обновляется в фоне, а адреса YouTube запрашиваются заранее ([prefetch]).
+     */
     fun resolve(query: ByteArray): ByteArray? {
         if (query.size < 12) return null
         val key = questionKey(query)
         val now = System.currentTimeMillis()
-        val cached = cache[key]?.takeIf { it.first > now }?.second
-        val body = cached ?: fetch(query.copyOf().also { it[0] = 0; it[1] = 0 })?.also { response ->
-            // Кэшируем только успешные ответы (RCODE = 0).
-            if (response.size >= 12 && response[3].toInt() and 0x0F == 0) cache[key] = (now + CACHE_MS) to response
+        val entry = cache[key]
+        val body = when {
+            entry != null && entry.freshUntil > now -> entry.body
+            entry != null && entry.staleUntil > now -> {
+                refreshLater(key, query)
+                entry.body
+            }
+            else -> fetchAndStore(key, query)
         } ?: return null
         return body.copyOf().also {
             it[0] = query[0]
             it[1] = query[1]
         }
     }
+
+    /** Заранее узнать адреса (A) — при старте VPN, чтобы первые соединения YouTube не ждали DoH. */
+    fun prefetch(hosts: Collection<String>) {
+        hosts.forEach { host ->
+            val query = runCatching { aQuery(host) }.getOrNull() ?: return@forEach
+            val entry = cache[questionKey(query)]
+            if (entry == null || entry.freshUntil <= System.currentTimeMillis()) refreshLater(questionKey(query), query)
+        }
+    }
+
+    private fun refreshLater(key: String, query: ByteArray) {
+        if (!refreshing.add(key)) return
+        workers.execute {
+            try {
+                fetchAndStore(key, query)
+            } finally {
+                refreshing.remove(key)
+            }
+        }
+    }
+
+    private fun fetchAndStore(key: String, query: ByteArray): ByteArray? =
+        fetch(query.copyOf().also { it[0] = 0; it[1] = 0 })?.also { response ->
+            // Кэшируем только успешные ответы (RCODE = 0).
+            if (response.size >= 12 && response[3].toInt() and 0x0F == 0) {
+                val now = System.currentTimeMillis()
+                cache[key] = Entry(now + FRESH_MS, now + STALE_MS, response)
+            }
+        }
 
     private fun fetch(query: ByteArray): ByteArray? {
         val start = preferred
@@ -83,11 +124,14 @@ class LocalDns private constructor(private val socket: DatagramSocket) {
             connection.setRequestProperty("Accept", "application/dns-message")
             connection.outputStream.use { it.write(query) }
             if (connection.responseCode != 200) error("HTTP ${connection.responseCode}")
+            // Поток дочитан и закрыт без disconnect(): соединение остаётся в пуле keep-alive,
+            // и следующий запрос не платит за новое TCP+TLS-рукопожатие.
             return connection.inputStream.use { input ->
                 ByteArrayOutputStream().also { input.copyTo(it) }.toByteArray()
             }
-        } finally {
+        } catch (e: Exception) {
             connection.disconnect()
+            throw e
         }
     }
 
@@ -100,7 +144,36 @@ class LocalDns private constructor(private val socket: DatagramSocket) {
             "https://1.0.0.1/dns-query",
         )
         private const val TIMEOUT_MS = 3500
-        private const val CACHE_MS = 5 * 60_000L
+        private const val FRESH_MS = 10 * 60_000L
+        private const val STALE_MS = 24 * 60 * 60_000L
+
+        /** Узлы, к которым YouTube подключается первым делом. */
+        val YouTubeHosts = listOf(
+            "www.youtube.com", "m.youtube.com", "youtube.com", "youtubei.googleapis.com", "youtube.googleapis.com",
+            "www.googleapis.com", "i.ytimg.com", "i9.ytimg.com", "s.ytimg.com", "yt3.ggpht.com", "yt4.ggpht.com",
+            "yt3.googleusercontent.com", "redirector.googlevideo.com", "play.googleapis.com", "jnn-pa.googleapis.com",
+            "suggestqueries-clients6.youtube.com", "www.google.com", "accounts.google.com",
+        )
+
+        /** Узлы того же кластера, что и [videoHost] (rr1…rr16---sn-xxx): по ним идёт видео. */
+        fun videoCluster(videoHost: String?): List<String> {
+            val suffix = videoHost?.substringAfter("---", "")?.takeIf { it.isNotEmpty() } ?: return emptyList()
+            return (1..16).map { "rr$it---$suffix" }
+        }
+
+        /** DNS-запрос A для [host] (id = 0, RD). */
+        internal fun aQuery(host: String): ByteArray {
+            val out = ByteArrayOutputStream()
+            out.write(byteArrayOf(0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+            host.trimEnd('.').split('.').forEach { label ->
+                val bytes = label.toByteArray(Charsets.US_ASCII)
+                require(bytes.size in 1..63)
+                out.write(bytes.size)
+                out.write(bytes)
+            }
+            out.write(byteArrayOf(0, 0, 1, 0, 1))
+            return out.toByteArray()
+        }
 
         @Volatile private var instance: LocalDns? = null
 

@@ -4,7 +4,7 @@ Android-приложение для обхода DPI-блокировки YouTub
 
 ```
 YouTube / ReVanced / Morphe ─► TUN (VpnService, только выбранные приложения)
-   ─► hev-socks5-tunnel ─► SOCKS5 127.0.0.1:10800 ─► byedpi (desync) ─► интернет
+   ─► hev-socks5-tunnel ─► SOCKS5 127.0.0.1:<свободный порт> ─► byedpi (desync) ─► интернет
 ```
 
 - **Только выбранные приложения** идут через туннель (`addAllowedApplication`), остальные — напрямую.

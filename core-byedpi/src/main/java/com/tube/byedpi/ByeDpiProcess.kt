@@ -41,7 +41,11 @@ class ByeDpiProcess private constructor(
         process.destroy()
         val deadline = System.currentTimeMillis() + 1500
         while (process.isAlive && System.currentTimeMillis() < deadline) Thread.sleep(20)
-        if (process.isAlive) process.destroyForcibly()
+        if (process.isAlive) {
+            process.destroyForcibly()
+            // Ждём смерти: иначе новый byedpi на том же порту увидит занятый порт.
+            runCatching { process.waitFor(1, java.util.concurrent.TimeUnit.SECONDS) }
+        }
     }
 
     companion object {
@@ -61,6 +65,12 @@ class ByeDpiProcess private constructor(
             fakeSni: String = Strategies.FakeSniOptions.first(),
             timeoutMs: Long = 3000,
         ): ByeDpiProcess {
+            // Порт ещё слушает чужой процесс (старый byedpi не успел выйти) — проверка ниже приняла бы его за наш.
+            val busyUntil = System.currentTimeMillis() + timeoutMs
+            while (isListening(port)) {
+                if (System.currentTimeMillis() > busyUntil) throw IllegalStateException("port $port is busy")
+                Thread.sleep(50)
+            }
             val args = resolveFakeFiles(context, strategy).map { it.replace(Strategies.SNI, fakeSni) }
             val command = listOf(executable(context).absolutePath) + StrategyArgs.commandLine(port, args, blockUdp)
             val builder = ProcessBuilder(command).redirectErrorStream(true)
@@ -101,6 +111,9 @@ class ByeDpiProcess private constructor(
             }
             arg.substring(0, at) + file.absolutePath
         }
+
+        /** Свободный порт на 127.0.0.1 (система выдаёт эфемерный, сразу освобождаем). */
+        fun freePort(): Int = java.net.ServerSocket(0, 1, java.net.InetAddress.getByName("127.0.0.1")).use { it.localPort }
 
         private fun isListening(port: Int): Boolean = runCatching {
             Socket().use { it.connect(InetSocketAddress("127.0.0.1", port), 100) }

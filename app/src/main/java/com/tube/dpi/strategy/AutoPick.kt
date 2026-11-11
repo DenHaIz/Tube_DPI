@@ -1,6 +1,7 @@
 package com.tube.dpi.strategy
 
 import android.content.Context
+import com.tube.byedpi.LocalDns
 import com.tube.byedpi.Strategies
 import com.tube.byedpi.Strategy
 import com.tube.byedpi.StrategyScore
@@ -12,11 +13,16 @@ import com.tube.dpi.data.SettingsRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 
 /** Ход подбора (общий для экрана и сторожа). */
@@ -74,6 +80,7 @@ class AutoPick(
             val saved = results.of(key)
             val current = settings.strategy.first()
             val discoveryOrder = (listOf(current) + saved?.working?.map { it.strategy }.orEmpty() + Strategies.builtIn).distinctBy { it.id }
+            LocalDns.shared().prefetch(LocalDns.YouTubeHosts + LocalDns.videoCluster(saved?.videoHost))
             val videoHost = tester.discoverVideoHost(discoveryOrder, blockUdp) ?: saved?.videoHost
             val probes = StrategyTester.defaultProbes(videoHost)
             val baseline = tester.baseline(probes)
@@ -91,16 +98,52 @@ class AutoPick(
                     is TestEvent.Finished -> ranking = event.ranking
                 }
             }
-            return ranking
+            return verify(key, tester, ranking, probes, blockUdp)
         } finally {
             _progress.value = _progress.value.copy(running = false)
         }
     }
 
+    /**
+     * Второй круг для прошедших: по [VERIFY_PARALLELISM] за раз, без нагрузки соседних стратегий.
+     * Стратегия, прошедшая один раз из двух, в YouTube работает через раз — она уходит из «рабочих».
+     */
+    private suspend fun verify(
+        key: String,
+        tester: StrategyTester,
+        ranking: List<StrategyScore>,
+        probes: List<com.tube.byedpi.Probe>,
+        blockUdp: Boolean,
+    ): List<StrategyScore> {
+        val passed = ranking.filter { it.works }.take(VERIFY_LIMIT)
+        if (passed.isEmpty()) return ranking
+        _progress.value = _progress.value.copy(total = _progress.value.total + passed.size)
+        log.value = log.value + "verify: ${passed.size}"
+        val gate = Semaphore(VERIFY_PARALLELISM)
+        val verified = coroutineScope {
+            passed.map { first ->
+                async {
+                    val again = gate.withPermit { tester.testOne(first.strategy, probes, blockUdp) }
+                    val merged = if (again.works) {
+                        // Скорость — средняя по двум кругам.
+                        StrategyScore(first.strategy, first.results.zip(again.results) { a, b -> a.copy(millis = (a.millis + b.millis) / 2) })
+                    } else {
+                        again
+                    }
+                    results.update(key) { it.copy(scores = it.scores + (merged.strategy.id to merged)) }
+                    log.value = log.value + ("verify " + describe(merged))
+                    _progress.value = _progress.value.copy(done = _progress.value.done + 1)
+                    merged
+                }
+            }.awaitAll()
+        }.associateBy { it.strategy.id }
+        return StrategyTester.rank(ranking.map { verified[it.strategy.id] ?: it })
+    }
+
     /** Проверка одной стратегии на свободном порту; результат тоже сохраняется. */
     suspend fun testOne(strategy: Strategy): StrategyScore {
         val videoHost = results.of(network.current.value?.key)?.videoHost
-        val score = tester().testOne(strategy, SINGLE_PORT, StrategyTester.defaultProbes(videoHost), settings.blockQuic.first())
+        val score = tester().testOne(strategy, StrategyTester.defaultProbes(videoHost), settings.blockQuic.first())
         network.current.value?.key?.let { key -> results.update(key) { it.copy(scores = it.scores + (strategy.id to score)) } }
         return score
     }
@@ -108,7 +151,8 @@ class AutoPick(
     private suspend fun tester() = StrategyTester(context, fakeSni = settings.fakeSni.first())
 
     companion object {
-        private const val SINGLE_PORT = 11100
+        private const val VERIFY_LIMIT = 16
+        private const val VERIFY_PARALLELISM = 2
 
         /** Строка журнала: стратегия и итог по каждому узлу — видно, что именно режет провайдер. */
         fun describe(score: StrategyScore): String = buildString {

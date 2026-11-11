@@ -70,7 +70,6 @@ sealed interface TestEvent {
  */
 class StrategyTester(
     private val context: Context,
-    private val basePort: Int = 11080,
     private val parallelism: Int = 6,
     private val timeoutMs: Int = 7000,
     private val fakeSni: String = Strategies.FakeSniOptions.first(),
@@ -78,18 +77,12 @@ class StrategyTester(
 
     fun run(strategies: List<Strategy>, probes: List<Probe>, blockUdp: Boolean = true): Flow<TestEvent> = channelFlow {
         val gate = Semaphore(parallelism)
-        val ports = ArrayDeque((0 until parallelism).map { basePort + it })
         var done = 0
         val scores = coroutineScope {
             strategies.map { strategy ->
                 async {
                     gate.withPermit {
-                        val port = synchronized(ports) { ports.removeFirst() }
-                        try {
-                            testOne(strategy, port, probes, blockUdp)
-                        } finally {
-                            synchronized(ports) { ports.addLast(port) }
-                        }
+                        testOne(strategy, probes, blockUdp)
                     }.also { score ->
                         synchronized(this@StrategyTester) { done++ }
                         send(TestEvent.Progress(done, strategies.size, score))
@@ -100,17 +93,28 @@ class StrategyTester(
         send(TestEvent.Finished(rank(scores)))
     }.flowOn(Dispatchers.IO)
 
-    /** Одна стратегия на своём экземпляре byedpi (порт [port] должен быть свободен). */
-    suspend fun testOne(strategy: Strategy, port: Int, probes: List<Probe>, blockUdp: Boolean): StrategyScore {
+    /**
+     * Одна стратегия на своём экземпляре byedpi. Порт каждый раз свободный: фиксированные порты сталкивались,
+     * когда сторож и кнопка «Проверить» запускали проверку одновременно, — и стратегия получала «ошибку».
+     */
+    suspend fun testOne(strategy: Strategy, probes: List<Probe>, blockUdp: Boolean): StrategyScore {
         val argv = when (val parsed = StrategyArgs.parse(strategy.args)) {
             is StrategyArgs.Result.Ok -> parsed.argv
             is StrategyArgs.Result.Error -> return StrategyScore(strategy, emptyList(), parsed.message)
         }
-        val proxy = try {
-            ByeDpiProcess.start(context, port, argv, blockUdp, fakeSni)
-        } catch (e: Exception) {
-            return StrategyScore(strategy, emptyList(), e.message)
+        var lastError: Exception? = null
+        var proxy: ByeDpiProcess? = null
+        for (attempt in 0 until START_ATTEMPTS) {
+            proxy = try {
+                withContext(Dispatchers.IO) { ByeDpiProcess.start(context, ByeDpiProcess.freePort(), argv, blockUdp, fakeSni) }
+            } catch (e: Exception) {
+                lastError = e
+                null
+            }
+            if (proxy != null) break
         }
+        if (proxy == null) return StrategyScore(strategy, emptyList(), lastError?.message ?: "start failed")
+        val port = proxy.port
         try {
             val results = coroutineScope {
                 probes.map { probe -> async { probe(port, probe) } }.awaitAll()
@@ -137,7 +141,15 @@ class StrategyTester(
         return try {
             val bytes = when (probe.kind) {
                 ProbeKind.Https -> httpsGet(port, probe.host, probe.path, target, timeoutMs).size
-                ProbeKind.ChromeHello -> chromeHandshake(port, probe.host, ChromeHello.build(chromeTemplate, probe.host), target, timeoutMs)
+                // Chrome переставляет расширения в каждом соединении, и SNI оказывается то в начале, то во втором
+                // TCP-сегменте. Стратегия должна пропускать все варианты, иначе в YouTube она сработает через раз.
+                ProbeKind.ChromeHello -> coroutineScope {
+                    HelloOrders.map { order ->
+                        async(Dispatchers.IO) {
+                            chromeHandshake(port, probe.host, ChromeHello.build(chromeTemplate, probe.host, order = order), target, timeoutMs)
+                        }
+                    }.awaitAll().min()
+                }
             }
             val ok = bytes >= target
             ProbeResult(probe, ok, (System.nanoTime() - started) / 1_000_000, bytes, if (ok) null else "short read $bytes")
@@ -154,9 +166,9 @@ class StrategyTester(
         for (strategy in candidates.take(DISCOVERY_ATTEMPTS)) {
             ensureActive()
             val argv = (StrategyArgs.parse(strategy.args) as? StrategyArgs.Result.Ok)?.argv ?: continue
-            val proxy = runCatching { ByeDpiProcess.start(context, DISCOVERY_PORT, argv, blockUdp, fakeSni) }.getOrNull() ?: continue
+            val proxy = runCatching { ByeDpiProcess.start(context, ByeDpiProcess.freePort(), argv, blockUdp, fakeSni) }.getOrNull() ?: continue
             try {
-                runCatching { findVideoHost(DISCOVERY_PORT, timeoutMs * 2) }.getOrNull()?.let { return@withContext it }
+                runCatching { findVideoHost(proxy.port, timeoutMs * 2) }.getOrNull()?.let { return@withContext it }
             } finally {
                 proxy.stop()
             }
@@ -182,8 +194,9 @@ class StrategyTester(
         const val BASELINE_ID = "direct"
 
         private const val CHROME_TEMPLATE = "fake/tls_clienthello_vk_com_kyber.bin"
-        private const val DISCOVERY_PORT = 11090
         private const val DISCOVERY_ATTEMPTS = 8
+        private const val START_ATTEMPTS = 3
+        private val HelloOrders = listOf(ChromeHello.Order.SniLast, ChromeHello.Order.SniFirst, ChromeHello.Order.Random)
         private const val FALLBACK_VIDEO_HOST = "redirector.googlevideo.com"
 
         /** Ответ сервера на ClientHello: ServerHello + сертификаты — несколько КБ. Меньше — DPI оборвал. */
@@ -199,6 +212,8 @@ class StrategyTester(
             return listOf(
                 Probe("www.youtube.com", "/", minBytes = 64 * 1024),
                 Probe("www.youtube.com", "", minBytes = CHROME_MIN_BYTES, kind = ProbeKind.ChromeHello),
+                // API приложения YouTube: без него лента и плеер не открываются, даже если видеоузел доступен.
+                Probe("youtubei.googleapis.com", "", minBytes = CHROME_MIN_BYTES, kind = ProbeKind.ChromeHello, group = ProbeGroup.Site),
                 Probe("i.ytimg.com", "/vi/jNQXAC9IVRw/hqdefault.jpg", minBytes = 8 * 1024),
                 Probe("i.ytimg.com", "", minBytes = CHROME_MIN_BYTES, kind = ProbeKind.ChromeHello),
                 Probe(video, if (videoHost != null) "/generate_204" else "/report_mapping?di=no", minBytes = 12),

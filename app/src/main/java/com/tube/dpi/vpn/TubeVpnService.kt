@@ -8,6 +8,7 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import androidx.core.app.ServiceCompat
 import com.tube.byedpi.ByeDpiProcess
+import com.tube.byedpi.LocalDns
 import com.tube.byedpi.StrategyArgs
 import com.tube.dpi.TubeApp
 import com.tube.dpi.apps.TargetApps
@@ -39,7 +40,6 @@ class TubeVpnService : VpnService() {
         const val ACTION_RESTART = "com.tube.dpi.RESTART"
         const val EXTRA_BY_AUTOSTART = "by_autostart"
 
-        private const val PROXY_PORT = 10800
         private const val MONITOR_INTERVAL_MS = 1000L
     }
 
@@ -90,8 +90,13 @@ class TubeVpnService : VpnService() {
             is StrategyArgs.Result.Ok -> parsed.argv
             is StrategyArgs.Result.Error -> return fail(FailReason.ProxyFailed, parsed.message)
         }
+        // Адреса YouTube — заранее: byedpi резолвит имена в своём единственном потоке и не должен ждать DoH.
+        val videoHost = container.results.of(container.network.current.value?.key)?.videoHost
+        LocalDns.shared().prefetch(LocalDns.YouTubeHosts + LocalDns.videoCluster(videoHost))
+        // Порт каждый раз свободный: старый byedpi после перезапуска мог ещё не отпустить прежний.
+        val port = ByeDpiProcess.freePort()
         proxy = try {
-            ByeDpiProcess.start(this, PROXY_PORT, argv, blockUdp = settings.blockQuic, fakeSni = settings.fakeSni)
+            ByeDpiProcess.start(this, port, argv, blockUdp = settings.blockQuic, fakeSni = settings.fakeSni)
         } catch (e: Exception) {
             return fail(FailReason.ProxyFailed, e.message)
         }
@@ -130,7 +135,7 @@ class TubeVpnService : VpnService() {
         } ?: return fail(FailReason.NoConsent, null)
         tun = fd
 
-        val config = File(cacheDir, "tunnel.yml").apply { writeText(TunnelConfig(socksPort = PROXY_PORT).toYaml()) }
+        val config = File(cacheDir, "tunnel.yml").apply { writeText(TunnelConfig(socksPort = port).toYaml()) }
         if (!TProxyService.TProxyStartService(config.absolutePath, fd.fd)) {
             return fail(FailReason.TunnelFailed, "hev-socks5-tunnel")
         }
@@ -140,7 +145,7 @@ class TubeVpnService : VpnService() {
         TunnelState.set(TunnelStatus.Running(System.currentTimeMillis(), settings.strategy.name, byAutostart))
         monitor = scope.launch { monitorLoop() }
         watchdog = scope.launch {
-            StrategyWatchdog(this@TubeVpnService, container, PROXY_PORT, settings.strategy.id) { next, reason ->
+            StrategyWatchdog(this@TubeVpnService, container, port, settings.strategy.id) { next, reason ->
                 container.chooseStrategy(next.id)
                 Notifications.showSwitched(this@TubeVpnService, settings.strategy.name, next.name, reason)
                 startService(Intent(this@TubeVpnService, TubeVpnService::class.java).setAction(ACTION_RESTART).putExtra(EXTRA_BY_AUTOSTART, byAutostart))

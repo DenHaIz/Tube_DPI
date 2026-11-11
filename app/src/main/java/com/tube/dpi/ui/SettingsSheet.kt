@@ -172,7 +172,7 @@ fun ColumnScope.SettingsSheet(vm: MainViewModel, actions: ShellActions, onAutost
                 is UpdateState.Available -> tr("Доступна версия ${s.release.version}", "Version ${s.release.version} is available")
                 is UpdateState.Downloading -> tr("Скачивание ${(s.progress * 100).toInt()}%", "Downloading ${(s.progress * 100).toInt()}%")
                 is UpdateState.Ready -> tr("Готово к установке", "Ready to install")
-                is UpdateState.Failed -> tr("Не удалось проверить", "Check failed")
+                is UpdateState.Failed -> tr("Не удалось: ${s.message}", "Failed: ${s.message}")
                 UpdateState.Idle -> null
             }
             if (status != null) {

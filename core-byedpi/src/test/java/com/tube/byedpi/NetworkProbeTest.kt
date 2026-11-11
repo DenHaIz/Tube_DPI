@@ -69,10 +69,12 @@ class NetworkProbeTest {
         val port = relay()
         val video = StrategyTester.findVideoHost(port, 15000)
         println("video host: $video")
-        listOfNotNull("www.youtube.com", "i.ytimg.com", video).forEach { host ->
-            val bytes = StrategyTester.chromeHandshake(port, host, ChromeHello.build(template, host), 2000, 8000)
-            println("chrome hello $host: $bytes B")
-            assertTrue(host, bytes >= 2000)
+        listOfNotNull("www.youtube.com", "youtubei.googleapis.com", "i.ytimg.com", video).forEach { host ->
+            ChromeHello.Order.entries.forEach { order ->
+                val bytes = StrategyTester.chromeHandshake(port, host, ChromeHello.build(template, host, order = order), 2000, 8000)
+                println("chrome hello $host $order: $bytes B")
+                assertTrue("$host $order", bytes >= 2000)
+            }
         }
         assertTrue(video != null)
     }

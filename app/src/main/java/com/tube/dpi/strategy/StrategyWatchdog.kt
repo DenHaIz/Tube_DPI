@@ -1,7 +1,9 @@
 package com.tube.dpi.strategy
 
 import android.content.Context
+import com.tube.byedpi.ProbeResult
 import com.tube.byedpi.Strategy
+import com.tube.byedpi.StrategyScore
 import com.tube.byedpi.StrategyTester
 import com.tube.dpi.AppContainer
 import com.tube.dpi.vpn.TunnelState
@@ -59,7 +61,8 @@ class StrategyWatchdog(
                 }
             }
 
-            val ok = checkCurrent(container.results.of(key)?.videoHost)
+            val checks = checkCurrent(container.results.of(key)?.videoHost)
+            val ok = checks.all { it.ok }
             TunnelState.setWatchdog(WatchdogStatus(System.currentTimeMillis(), ok))
             if (ok) {
                 failures = 0
@@ -73,16 +76,18 @@ class StrategyWatchdog(
                 interval = RECHECK_MS
                 continue
             }
+            // Стратегия не работает в самом VPN — запоминаем это, чтобы она не стояла в «рабочих» первой.
+            container.resolveStrategy(currentId)?.let { current ->
+                container.results.update(key) { it.copy(scores = it.scores + (currentId to StrategyScore(current, checks))) }
+            }
             val replacement = findReplacement(key) ?: continue
             onSwitch(replacement, SwitchReason.Failed)
             return@coroutineScope
         }
     }
 
-    private suspend fun checkCurrent(videoHost: String?): Boolean {
-        val tester = StrategyTester(context)
-        return tester.checkThrough(proxyPort, StrategyTester.defaultProbes(videoHost)).all { it.ok }
-    }
+    private suspend fun checkCurrent(videoHost: String?): List<ProbeResult> =
+        StrategyTester(context).checkThrough(proxyPort, StrategyTester.defaultProbes(videoHost))
 
     /** Есть ли интернет вообще: без него менять стратегию бессмысленно. */
     private suspend fun internetAvailable(): Boolean = coroutineScope {
@@ -103,9 +108,10 @@ class StrategyWatchdog(
     }
 
     companion object {
-        private const val FIRST_CHECK_MS = 60_000L
+        // Первая проверка вскоре после включения: нерабочая стратегия заменяется за полминуты, а не за полторы минуты.
+        private const val FIRST_CHECK_MS = 15_000L
         private const val CHECK_INTERVAL_MS = 10 * 60_000L
-        private const val RECHECK_MS = 30_000L
+        private const val RECHECK_MS = 15_000L
         private const val FULL_RETEST_MS = 60 * 60_000L
         private const val MAX_CANDIDATES = 6
         private val ControlProbes = listOf("ya.ru" to "/", "www.gstatic.com" to "/generate_204")
